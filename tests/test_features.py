@@ -1,7 +1,7 @@
 import pandas as pd
 import pytest
 
-from app.features import DataError, build_features, ip_to_int, load_packets
+from threat_detector.features import DataError, build_features, ip_to_int, load_packets
 
 
 def test_ip_to_int_is_collision_free():

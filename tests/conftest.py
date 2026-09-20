@@ -4,11 +4,39 @@ import sys
 from pathlib import Path
 
 import pytest
+from flask.testing import FlaskClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app import create_app
-from app.config import Config
+from threat_detector import create_app, jobs
+from threat_detector.auth import CSRF_HEADER, CSRF_VALUE
+from threat_detector.config import Config
+
+
+class BrowserLikeClient(FlaskClient):
+    """A client that behaves like the app's own front end.
+
+    The real UI sends the anti-CSRF header on every request, so the default
+    test client does too. Tests that a *missing* header is rejected use a raw
+    client in test_auth.py instead.
+    """
+
+    def open(self, *args, **kwargs):
+        headers = dict(kwargs.pop("headers", None) or {})
+        headers.setdefault(CSRF_HEADER, CSRF_VALUE)
+        return super().open(*args, headers=headers, **kwargs)
+
+
+def train_and_wait(client, path: str = "/api/train", **kwargs) -> dict:
+    """POST to the training endpoint and block until the job finishes.
+
+    Training is asynchronous over HTTP, so a test that wants a trained model
+    has to wait for the worker rather than assume the response means "done".
+    """
+    response = client.post(path, **kwargs)
+    assert response.status_code == 202, response.get_data(as_text=True)
+    record = jobs.wait(client.application.config["APP_CONFIG"], timeout=60)
+    return record
 
 
 def write_packets(path: Path, rows: int = 200) -> Path:
@@ -110,6 +138,7 @@ def dataset(config) -> Path:
 def client(config):
     app = create_app(config)
     app.config.update(TESTING=True)
+    app.test_client_class = BrowserLikeClient
     with app.test_client() as test_client:
         yield test_client
 
@@ -123,5 +152,6 @@ def flow_dataset(flow_config) -> Path:
 def flow_client(flow_config):
     app = create_app(flow_config)
     app.config.update(TESTING=True)
+    app.test_client_class = BrowserLikeClient
     with app.test_client() as test_client:
         yield test_client

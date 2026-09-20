@@ -1,0 +1,28 @@
+services:
+  detector:
+    build: .
+    image: ai-threat-detector:1.0.0
+    ports:
+      # Loopback only. Change to "5000:5000" to expose it, and only ever with
+      # API_TOKEN set — the API exposes your traffic analysis.
+      - "127.0.0.1:5000:5000"
+    environment:
+      # Generate one with: openssl rand -hex 32
+      API_TOKEN: ${API_TOKEN:?set API_TOKEN, e.g. in a .env file}
+      ALLOWED_HOSTS: ${ALLOWED_HOSTS:-127.0.0.1,localhost}
+      WINDOW_SECONDS: ${WINDOW_SECONDS:-300}
+    volumes:
+      # Put packets.csv and baseline.csv here.
+      - ./data:/data:ro
+      # The model and its signing key. Not the same volume as the data: the
+      # signature is worthless if whatever can write the model can read the key.
+      - detector-state:/var/lib/detector
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+
+volumes:
+  detector-state:

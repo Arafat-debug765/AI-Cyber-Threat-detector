@@ -5,21 +5,25 @@ __pycache__/
 .venv/
 venv/
 env/
+build/
+dist/
+
+# Secrets — the HMAC key authenticating the model. Committing it would make
+# the signature worthless: anyone could forge a model this app would load.
+.secrets/
+*.key
+.env
 
 # Project artefacts — regenerate, don't commit
 data/*.csv
-models/*.pkl
-models/*.sig
-models/*.key
+models/*
 *.pkl
 
 # Tooling
 .pytest_cache/
+.ruff_cache/
 .coverage
 htmlcov/
-
-# Environment
-.env
 
 # OS / editors
 .DS_Store

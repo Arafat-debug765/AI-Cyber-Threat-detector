@@ -39,7 +39,7 @@ def load_packets(path: Path) -> pd.DataFrame:
     if not path.exists():
         raise DataError(
             f"Dataset '{path.name}' not found. "
-            "Generate one with: python scripts/generate_packets.py"
+            "Generate one with: threat-detector generate"
         )
     try:
         df = pd.read_csv(path)

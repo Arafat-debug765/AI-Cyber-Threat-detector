@@ -33,7 +33,7 @@ from sklearn.svm import OneClassSVM
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app.features import FEATURE_COLUMNS, build_features
+from threat_detector.features import FEATURE_COLUMNS, build_features
 
 NORMAL_PROTOCOLS = [1, 6, 17]
 ODD_PROTOCOLS = [47, 50, 89, 132]
