@@ -2,9 +2,10 @@
 import pandas as pd
 import pytest
 
-from app import model as model_service
-from app.features import DataError
-from app.sessions import FLOW_FEATURE_COLUMNS, build_flow_features
+from tests.conftest import train_and_wait
+from threat_detector import model as model_service
+from threat_detector.features import DataError
+from threat_detector.sessions import FLOW_FEATURE_COLUMNS, build_flow_features
 
 SCANNER = "192.168.0.66"
 
@@ -66,7 +67,8 @@ def test_flow_summary_breaks_down_by_source(flow_config, flow_dataset):
 
 
 def test_flow_api_round_trip(flow_client, flow_dataset):
-    assert flow_client.post("/api/train").get_json()["feature_set"] == "flow"
+    record = train_and_wait(flow_client)
+    assert record["result"]["feature_set"] == "flow"
     payload = flow_client.get("/api/anomalies").get_json()
     assert payload["count"] >= 1
     assert "src_ip" in payload["anomalies"][0]
@@ -113,3 +115,42 @@ def test_single_packet_window_has_no_nan():
     flows = build_flow_features(df)
     assert not flows[FLOW_FEATURE_COLUMNS].isna().any().any()
     assert flows.iloc[0]["std_length"] == 0.0
+
+
+# ---- degenerate windows ---------------------------------------------------
+
+def test_tiny_windows_are_dropped_before_fitting():
+    """A one-packet window is a capture-boundary artifact, not behaviour.
+
+    Left in, it scores as an extreme outlier on every feature at once, and a
+    threshold calibrated at the minimum baseline score is then set by that
+    artifact — which hid a 200-host sweep underneath it.
+    """
+    rows = [{"timestamp": f"2026-01-01T00:00:{s:02d}", "src_ip": "192.168.0.5",
+             "dst_ip": "10.0.0.1", "dst_port": 443, "protocol": 6,
+             "packet_length": 300} for s in range(10)]
+    rows.append({"timestamp": "2026-01-01T00:00:01", "src_ip": "192.168.0.99",
+                 "dst_ip": "10.0.0.1", "dst_port": 443, "protocol": 6,
+                 "packet_length": 300})
+
+    kept = build_flow_features(pd.DataFrame(rows), 300, min_packets=3)
+    assert set(kept["src_ip"]) == {"192.168.0.5"}
+
+    everything = build_flow_features(pd.DataFrame(rows), 300, min_packets=0)
+    assert set(everything["src_ip"]) == {"192.168.0.5", "192.168.0.99"}
+
+
+def test_dropping_everything_is_an_error_not_an_empty_model():
+    rows = [{"timestamp": "2026-01-01T00:00:00", "src_ip": f"192.168.0.{i}",
+             "dst_ip": "10.0.0.1", "dst_port": 443, "protocol": 6,
+             "packet_length": 300} for i in range(1, 5)]
+    with pytest.raises(DataError, match="MIN_SESSION_PACKETS"):
+        build_flow_features(pd.DataFrame(rows), 300, min_packets=5)
+
+
+def test_timestamps_are_serialised_as_iso_not_epoch_millis(flow_config, flow_dataset):
+    """`window_start: 1789878600000` is unreadable and unit-ambiguous."""
+    model_service.train(flow_config)
+    row = model_service.detect(flow_config)["anomalies"][0]
+    assert isinstance(row["window_start"], str)
+    assert row["window_start"].startswith("2026-01-01T")
