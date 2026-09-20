@@ -13,10 +13,13 @@ the behavioural features that make those patterns visible.
 from __future__ import annotations
 
 import ipaddress
+import logging
 
 import pandas as pd
 
 from .features import DataError, ip_to_int
+
+logger = logging.getLogger(__name__)
 
 FLOW_FEATURE_COLUMNS = [
     "packets",
@@ -62,11 +65,19 @@ def _is_external(address: str) -> bool:
         return False
 
 
-def build_flow_features(df: pd.DataFrame, window_seconds: int = 60) -> pd.DataFrame:
+def build_flow_features(
+    df: pd.DataFrame, window_seconds: int = 60, min_packets: int = 0
+) -> pd.DataFrame:
     """Aggregate packets into per-source, per-window behavioural sessions.
 
     Returns a frame whose index is a RangeIndex and which carries both the
     identity columns (src_ip, window_start) and FLOW_FEATURE_COLUMNS.
+
+    `min_packets` drops windows too small to describe behaviour. A window
+    holding one packet — which is what the first and last window of any capture
+    tends to be — looks like an extreme outlier to the model on every feature
+    at once, and is an artifact of where the capture happened to start, not
+    something an analyst can act on.
     """
     if window_seconds < 1:
         raise DataError("window_seconds must be at least 1.")
@@ -113,6 +124,20 @@ def build_flow_features(df: pd.DataFrame, window_seconds: int = 60) -> pd.DataFr
     # and NaN would silently drop the row at fit time.
     features = features.fillna(0.0).reset_index()
     features["src_ip_int"] = features["src_ip"].map(ip_to_int)
+
+    if min_packets > 1:
+        keep = features["packets"] >= min_packets
+        dropped = int((~keep).sum())
+        if dropped:
+            logger.info("Ignored %d session(s) with fewer than %d packets",
+                        dropped, min_packets)
+        features = features[keep].reset_index(drop=True)
+        if features.empty:
+            raise DataError(
+                f"Every session had fewer than {min_packets} packets. Lower "
+                "MIN_SESSION_PACKETS, or widen WINDOW_SECONDS so sessions "
+                "gather enough traffic to describe behaviour."
+            )
     return features
 
 

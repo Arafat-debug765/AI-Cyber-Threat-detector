@@ -3,7 +3,7 @@
 
 Requires scapy and elevated privileges (packet capture needs raw sockets):
 
-    sudo python scripts/capture_packets.py --count 500 --iface en0
+    sudo python scripts/live_capture.py --count 500 --iface en0
 
 Only capture traffic on networks you own or are authorised to monitor.
 """

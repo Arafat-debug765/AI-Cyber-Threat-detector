@@ -6,22 +6,24 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements-dev.txt      # runtime deps + pytest + scapy
+pip install -e '.[all]'                  # editable install + scapy, gunicorn, dev tools
 
-python scripts/generate_packets.py                                  # capture with planted attacks
-python scripts/generate_packets.py -o data/baseline.csv --no-attacks
-BASELINE_FILE=data/baseline.csv python run.py                       # 127.0.0.1:5000
-
-BASELINE_FILE=data/baseline.csv python scripts/check_detection.py   # detection-quality gate
+threat-detector generate --output data/packets.csv                  # capture with attacks
+threat-detector generate --output data/baseline.csv --no-attacks    # known-good
+threat-detector --baseline data/baseline.csv train
+threat-detector detect
+threat-detector --baseline data/baseline.csv selfcheck              # detection-quality gate
+threat-detector serve                                               # 127.0.0.1:5000
 
 pytest                                   # whole suite
 ruff check .                             # lint (ruff.toml, target py39)
-pytest tests/test_model.py::test_detect_flags_the_planted_outliers   # one test
-pytest -k summary                        # by keyword
+pytest tests/test_sessions.py::test_flow_mode_flags_the_scanner     # one test
+pytest -k calibration                    # by keyword
 ```
 
 macOS: port 5000 is taken by AirPlay Receiver, which answers `403 AirTunes`.
-Use `PORT=5050 python run.py`, and hit `127.0.0.1` rather than `localhost` —
+Use `threat-detector serve --port 5050`, and hit `127.0.0.1` rather than
+`localhost` —
 `localhost` resolves to `::1` first, where AirPlay listens.
 
 ## Architecture
@@ -29,23 +31,32 @@ Use `PORT=5050 python run.py`, and hit `127.0.0.1` rather than `localhost` —
 Flask app factory (`create_app`) + a service layer, deliberately split so the
 HTTP layer holds no logic:
 
-- `app/config.py` — frozen `Config` dataclass, every field from an env var.
+- `threat_detector/config.py` — frozen `Config` dataclass, every field from an env var.
   Paths resolve against `BASE_DIR`. **Config is passed in, never read from
   globals** — that is what lets tests point the app at a `tmp_path` dataset.
-- `app/features.py` — CSV load, validation, feature engineering. Raises
+- `threat_detector/features.py` — CSV load, validation, feature engineering. Raises
   `DataError` for anything wrong with the data.
-- `app/model.py` — `train`, `detect`, `summarize`, `status`. Raises
+- `threat_detector/model.py` — `train`, `detect`, `summarize`, `status`. Raises
   `ModelNotTrained` when no `model.pkl` exists.
-- `app/routes.py` — thin handlers that call the service layer and map the two
-  domain exceptions to 400 and 409 via `app_errorhandler`.
+- `threat_detector/routes.py` — thin handlers that call the service layer and map domain
+  exceptions to 400/409 via `app_errorhandler`. **No logic lives here**: anything
+  the web interface can do, `cli.py` must be able to do too.
+- `threat_detector/auth.py` — Host allowlist, CSRF header, API token, security
+  headers. Installed by the factory as a single `before_request` chain.
+- `threat_detector/jobs.py` — background training. State is a JSON file beside the
+  model, not memory, so it survives a restart and is visible to every gunicorn
+  worker.
+- `threat_detector/integrity.py` — the signature lives *inside* the model file so
+  one `os.replace` installs both atomically. Two files could not be replaced
+  together, and a crash between them bricked the instance.
 
 Two feature sets, chosen by `FEATURE_SET`:
 
-- `flow` (default, `app/sessions.py`) — packets aggregated into (source, window)
+- `flow` (default, `threat_detector/sessions.py`) — packets aggregated into (source, window)
   sessions with behavioural features. This is the one that can represent scans,
   sweeps and beaconing; per-packet features cannot, and no model choice fixes
   that. `WINDOW_SECONDS` must exceed the period of any beacon to be detected.
-- `packet` (`app/features.py`) — the original per-packet features. IPs are packed
+- `packet` (`threat_detector/features.py`) — the original per-packet features. IPs are packed
   32-bit integers, not summed octets (the sum collides: `192.168.1.5` and
   `5.1.168.192` both give 366).
 
@@ -65,6 +76,22 @@ a bundle whose feature set disagrees with the current config.
 `contamination` is a budget, not a discovery: the model flags that fraction of
 the dataset whether or not that many packets are genuinely abnormal.
 
+**`CALIBRATION_QUANTILE` is a target false-positive rate, not a safety margin.**
+The threshold sits at that quantile of the *baseline's* scores, so 0.02 means
+"accept ~2% of known-good sessions alarming". Setting it to 0.0 sounds stricter
+and detects worse: the bar becomes the single lowest baseline score, so one
+freak session decides it. Measured across eight baselines — 0.02 caught 4/4
+reference attacks every run, 0.0 managed 6 runs out of 8. Do not "tighten" this
+to 0.0 without re-running `selfcheck` across several seeds.
+
+`MIN_SESSION_PACKETS` removes the commonest such artifact (a one-packet window
+at a capture boundary). Any statistic taken at the extreme of a small sample is
+set by its worst artifact — expect this class of bug to recur.
+
+`model.scored()` memoises one scoring pass per (model, capture) fingerprint;
+`/api/anomalies` and `/api/summary` share it. Call `clear_cache()` after
+anything that changes the model.
+
 `ALGORITHM` picks the detector (`iforest` default, `lof` alternative) via
 `model.build_estimator`. The choice is benchmarked, not assumed — run
 `scripts/benchmark_models.py` before changing the default; its `overlapping`
@@ -83,9 +110,9 @@ ensemble was measured and rejected as worse than either alone.
   handler in `routes.py`, or ordinary 404/405s become 500s.
 - `/train` and `/anomalies` are legacy aliases for the `/api/*` routes and are
   covered by tests — keep them working.
-- No front-end build step and no CDN: charts in `app/static/charts.js` are
+- No front-end build step and no CDN: charts in `threat_detector/static/charts.js` are
   hand-rolled SVG. Keep it dependency-free.
-- `joblib.load` unpickles, which executes code. `app/integrity.py` signs every
+- `joblib.load` unpickles, which executes code. `threat_detector/integrity.py` signs every
   saved model and **verifies before loading, never after** — checking afterwards
   would be checking a file that already ran. Do not add a load path that skips
   `verify()`.
@@ -93,5 +120,5 @@ ensemble was measured and rejected as worse than either alone.
 ## Data
 
 `data/*.csv` and `models/*.pkl` are git-ignored and regenerated, never committed.
-`scripts/generate_packets.py` is seeded (default 42), so datasets are
+`threat_detector/synth.py` is seeded (default 42), so datasets are
 reproducible; `RANDOM_STATE` does the same for the model.

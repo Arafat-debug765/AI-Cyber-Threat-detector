@@ -3,10 +3,11 @@
 The central property: a detector must be silent on traffic that contains
 nothing wrong. A quota-based detector cannot be, by construction.
 """
+import math
 from dataclasses import replace
 
-from app import model as model_service
 from tests.conftest import write_sessions
+from threat_detector import model as model_service
 
 
 def _clean_baseline(tmp_path):
@@ -31,16 +32,48 @@ def test_baseline_training_reports_its_source(flow_config, flow_dataset, tmp_pat
 
     assert result["fitted_on_baseline"] is True
     assert result["fitted_on"].endswith("baseline.csv")
-    assert result["calibration_quantile"] == 0.0
+    assert result["calibration_quantile"] == model_service.DEFAULT_FALSE_POSITIVE_RATE
 
 
-def test_baseline_trained_model_is_silent_on_clean_traffic(flow_config, tmp_path):
-    """No alarm when nothing is wrong — the property a quota cannot provide."""
+def test_the_quantile_is_a_false_positive_rate(flow_config, tmp_path):
+    """The threshold is set at this quantile of the baseline's own scores.
+
+    So scoring the baseline back produces about that fraction of alerts — by
+    construction. It is an operating point, not a promise of silence.
+    """
     baseline = _clean_baseline(tmp_path)
-    config = replace(flow_config, baseline_file=baseline, data_file=baseline)
+    config = replace(flow_config, baseline_file=baseline, data_file=baseline,
+                     calibration_quantile=0.05)
+    model_service.train(config)
+
+    result = model_service.detect(config)
+    expected = math.ceil(0.05 * result["total_packets"])
+    assert result["count"] <= expected
+
+
+def test_zero_rate_means_nothing_known_good_alarms(flow_config, tmp_path):
+    """The conservative operating point: silence, at the cost of recall."""
+    baseline = _clean_baseline(tmp_path)
+    config = replace(flow_config, baseline_file=baseline, data_file=baseline,
+                     calibration_quantile=0.0)
     model_service.train(config)
 
     assert model_service.detect(config)["count"] == 0
+
+
+def test_a_lone_outlying_baseline_session_is_called_out(flow_config, tmp_path, caplog):
+    """At rate 0.0 one freak session sets the bar, and that must not be silent."""
+    import logging
+
+    baseline = _clean_baseline(tmp_path)
+    config = replace(flow_config, baseline_file=baseline, data_file=baseline,
+                     calibration_quantile=0.0, min_session_packets=0)
+    with caplog.at_level(logging.WARNING):
+        model_service.train(config)
+
+    # Either it warned, or no session was extreme enough to warrant one.
+    if caplog.records:
+        assert any("single baseline session" in r.message for r in caplog.records)
 
 
 def test_baseline_trained_model_still_flags_the_scanner(flow_config, flow_dataset, tmp_path):

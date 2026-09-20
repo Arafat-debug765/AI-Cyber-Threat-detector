@@ -2,9 +2,9 @@ from dataclasses import replace
 
 import pytest
 
-from app import model as model_service
-from app.features import DataError
-from app.model import ModelNotTrained
+from threat_detector import model as model_service
+from threat_detector.features import DataError
+from threat_detector.model import ModelNotTrained
 
 
 def test_train_persists_model(config, dataset):

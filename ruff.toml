@@ -14,6 +14,7 @@ ignore = [
 [lint.per-file-ignores]
 "scripts/*" = ["S603", "S607"]
 # `random` seeds synthetic demo data and test fixtures — no security role.
-"scripts/generate_packets.py" = ["S311"]
+"threat_detector/synth.py" = ["S311"]
 "scripts/benchmark_models.py" = ["S311"]
-"tests/*" = ["S311"]
+# Test fixtures use literal secrets and bind-address strings on purpose.
+"tests/*" = ["S311", "S104", "S105", "S106"]

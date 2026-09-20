@@ -22,20 +22,43 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
 
-      - name: Install dependencies
-        run: pip install -r requirements-dev.txt
+      - name: Install
+        run: pip install -e '.[all]'
 
       - name: Lint
         run: ruff check .
 
       - name: Test
-        run: pytest -q
+        run: pytest
 
-      - name: End-to-end detection check
+      - name: Detection quality gate
         # Guards the property the whole design rests on: attacks in the capture
-        # are found, and a clean capture raises nothing.
+        # are found, and a clean capture raises nothing. Unit tests cannot tell
+        # you the detector got worse.
         run: |
-          python scripts/generate_packets.py --output data/attacks.csv
-          python scripts/generate_packets.py --output data/clean.csv --no-attacks
-          BASELINE_FILE=data/clean.csv DATA_FILE=data/attacks.csv \
-            python scripts/check_detection.py
+          threat-detector generate --output data/attacks.csv
+          threat-detector generate --output data/clean.csv --no-attacks
+          threat-detector --data data/attacks.csv --baseline data/clean.csv selfcheck
+
+      - name: CLI smoke test
+        run: |
+          threat-detector --version
+          threat-detector --data data/attacks.csv --model data/m.pkl --baseline data/clean.csv train
+          threat-detector --data data/attacks.csv --model data/m.pkl inspect
+          threat-detector --data data/attacks.csv --model data/m.pkl detect --json > /dev/null
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build and verify the wheel installs clean
+        run: |
+          pip install build
+          python -m build --wheel
+          pip install dist/*.whl
+          threat-detector --version
+      - name: Build the container image
+        run: docker build -t ai-threat-detector:ci .
