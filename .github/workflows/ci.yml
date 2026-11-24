@@ -7,12 +7,20 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        # 3.9 is the declared floor; 3.13 is the newest supported.
-        python-version: ["3.9", "3.12", "3.13"]
+        # 3.9 is the declared floor because it is what macOS's system Python
+        # still provides. It is end-of-life, and ubuntu-latest (26.04) no
+        # longer ships it, so that one job pins the newest image that does.
+        include:
+          - python-version: "3.9"
+            os: ubuntu-24.04
+          - python-version: "3.12"
+            os: ubuntu-latest
+          - python-version: "3.13"
+            os: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
