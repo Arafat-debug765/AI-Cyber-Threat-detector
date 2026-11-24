@@ -1,11 +1,11 @@
 # Build a runnable image. Multi-stage so the wheel build tooling does not ship.
-FROM python:3.12-slim AS build
+FROM python:3.15-slim AS build
 WORKDIR /src
 COPY pyproject.toml README.md LICENSE ./
 COPY threat_detector ./threat_detector
 RUN pip install --no-cache-dir build && python -m build --wheel --outdir /dist
 
-FROM python:3.12-slim
+FROM python:3.15-slim
 # Captures can be large and pandas is not frugal; fail loudly rather than
 # swapping. libpcap is needed only if the image is used to read .pcap files.
 RUN apt-get update \
