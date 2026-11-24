@@ -2,11 +2,14 @@
 import pandas as pd
 import pytest
 
-from app import model as model_service
-from app.features import DataError
-from app.sessions import FLOW_FEATURE_COLUMNS, build_flow_features
+from tests.conftest import train_and_wait
+from threat_detector import model as model_service
+from threat_detector.features import DataError
+from threat_detector.sessions import FLOW_FEATURE_COLUMNS, build_flow_features
 
 SCANNER = "192.168.0.66"
+ROW_BASE = {"src_ip": "192.168.0.5", "dst_ip": "10.0.0.1", "dst_port": 443,
+            "protocol": 6, "packet_length": 300}
 
 
 def test_flow_aggregation_shape(flow_config, flow_dataset):
@@ -66,7 +69,8 @@ def test_flow_summary_breaks_down_by_source(flow_config, flow_dataset):
 
 
 def test_flow_api_round_trip(flow_client, flow_dataset):
-    assert flow_client.post("/api/train").get_json()["feature_set"] == "flow"
+    record = train_and_wait(flow_client)
+    assert record["result"]["feature_set"] == "flow"
     payload = flow_client.get("/api/anomalies").get_json()
     assert payload["count"] >= 1
     assert "src_ip" in payload["anomalies"][0]
@@ -113,3 +117,119 @@ def test_single_packet_window_has_no_nan():
     flows = build_flow_features(df)
     assert not flows[FLOW_FEATURE_COLUMNS].isna().any().any()
     assert flows.iloc[0]["std_length"] == 0.0
+
+
+# ---- degenerate windows ---------------------------------------------------
+
+def test_tiny_windows_are_dropped_before_fitting():
+    """A one-packet window is a capture-boundary artifact, not behaviour.
+
+    Left in, it scores as an extreme outlier on every feature at once, and a
+    threshold calibrated at the minimum baseline score is then set by that
+    artifact — which hid a 200-host sweep underneath it.
+    """
+    rows = [{"timestamp": f"2026-01-01T00:00:{s:02d}", "src_ip": "192.168.0.5",
+             "dst_ip": "10.0.0.1", "dst_port": 443, "protocol": 6,
+             "packet_length": 300} for s in range(10)]
+    rows.append({"timestamp": "2026-01-01T00:00:01", "src_ip": "192.168.0.99",
+                 "dst_ip": "10.0.0.1", "dst_port": 443, "protocol": 6,
+                 "packet_length": 300})
+
+    kept = build_flow_features(pd.DataFrame(rows), 300, min_packets=3)
+    assert set(kept["src_ip"]) == {"192.168.0.5"}
+
+    everything = build_flow_features(pd.DataFrame(rows), 300, min_packets=0)
+    assert set(everything["src_ip"]) == {"192.168.0.5", "192.168.0.99"}
+
+
+def test_dropping_everything_is_an_error_not_an_empty_model():
+    rows = [{"timestamp": "2026-01-01T00:00:00", "src_ip": f"192.168.0.{i}",
+             "dst_ip": "10.0.0.1", "dst_port": 443, "protocol": 6,
+             "packet_length": 300} for i in range(1, 5)]
+    with pytest.raises(DataError, match="MIN_SESSION_PACKETS"):
+        build_flow_features(pd.DataFrame(rows), 300, min_packets=5)
+
+
+def test_timestamps_are_serialised_as_iso_not_epoch_millis(flow_config, flow_dataset):
+    """`window_start: 1789878600000` is unreadable and unit-ambiguous."""
+    model_service.train(flow_config)
+    row = model_service.detect(flow_config)["anomalies"][0]
+    assert isinstance(row["window_start"], str)
+    assert row["window_start"].startswith("2026-01-01T")
+
+
+def test_vectorised_interarrival_matches_the_per_session_definition():
+    """Speed-up guard: the vectorised gaps must equal the obvious computation.
+
+    Inter-arrival stats used to be computed by a Python function per session,
+    which dominated runtime; the vectorised version must not change a number.
+    """
+    import numpy as np
+
+    rng = np.random.default_rng(5)
+    n = 3000
+    df = pd.DataFrame({
+        "timestamp": 1767225600 + rng.uniform(0, 1200, n),
+        "src_ip": [f"192.168.0.{h}" for h in rng.integers(1, 40, n)],
+        "dst_ip": "10.0.0.5", "dst_port": 443, "protocol": 6,
+        "packet_length": rng.integers(40, 1500, n),
+    })
+    got = build_flow_features(df, 300).set_index(["src_ip", "window_start"])
+
+    ts = pd.to_datetime(df["timestamp"], unit="s", utc=True)
+    width = pd.Timedelta(seconds=300)
+    windows = ts.min() + ((ts - ts.min()) // width) * width  # anchored at the first packet
+    for (src, window), group in df.assign(ts=ts, w=windows).groupby(["src_ip", "w"]):
+        gaps = group["ts"].sort_values().diff().dt.total_seconds().dropna()
+        mean = gaps.mean() if len(gaps) else 0.0
+        std = gaps.std(ddof=0) if len(gaps) else 0.0
+        assert got.loc[(src, window), "mean_interarrival"] == pytest.approx(mean)
+        assert got.loc[(src, window), "std_interarrival"] == pytest.approx(std)
+
+
+
+def test_results_do_not_depend_on_the_time_of_day_a_capture_started():
+    """The same traffic, recorded at a different wall-clock phase, must analyse
+    identically. With clock-aligned windows a capture starting at :54:58 got a
+    two-second first window whose sliver sessions set the alert threshold and
+    hid three of four attacks.
+    """
+    rows = [{"timestamp": 1767225600 + s, "src_ip": f"192.168.0.{1 + s % 9}",
+             "dst_ip": "10.0.0.5", "dst_port": 443, "protocol": 6, "packet_length": 300}
+            for s in range(0, 900)]
+    reference = build_flow_features(pd.DataFrame(rows), 300)
+    for phase in (2, 58, 150, 298):
+        shifted = [{**r, "timestamp": r["timestamp"] + phase} for r in rows]
+        got = build_flow_features(pd.DataFrame(shifted), 300)
+        cols = ["src_ip", "packets", "bytes_total", "distinct_dst_ips", "std_interarrival"]
+        pd.testing.assert_frame_equal(got[cols], reference[cols])
+
+
+def test_first_window_starts_at_the_first_packet():
+    rows = [{**ROW_BASE, "timestamp": f"2026-01-01T03:54:{58 + s % 2:02d}"} for s in range(4)]
+    got = build_flow_features(pd.DataFrame(rows), 300)
+    assert str(got["window_start"].iloc[0]) == "2026-01-01 03:54:58+00:00"
+
+
+def test_a_sliver_of_a_final_window_is_dropped():
+    """Three packets in the last second of a capture are not five minutes of behaviour."""
+    rows = [{**ROW_BASE, "timestamp": 1767225600 + s, "src_ip": f"192.168.0.{1 + s % 5}"}
+            for s in range(0, 600)]
+    rows += [{**ROW_BASE, "timestamp": 1767225600 + 601, "src_ip": "192.168.0.99"}] * 3
+    kept = build_flow_features(pd.DataFrame(rows), 300, min_packets=3, min_coverage=0.5)
+    assert "192.168.0.99" not in set(kept["src_ip"])
+    unfiltered = build_flow_features(pd.DataFrame(rows), 300, min_packets=3, min_coverage=0)
+    assert "192.168.0.99" in set(unfiltered["src_ip"])
+
+
+def test_a_capture_shorter_than_one_window_is_kept():
+    """All of it is partial window; dropping it would leave nothing."""
+    rows = [{**ROW_BASE, "timestamp": 1767225600 + s} for s in range(30)]
+    assert len(build_flow_features(pd.DataFrame(rows), 300, min_coverage=0.5)) == 1
+
+
+def test_coverage_setting_is_validated():
+    from threat_detector.config import Config
+
+    with pytest.raises(ValueError, match="MIN_WINDOW_COVERAGE"):
+        Config(min_window_coverage=1.5)

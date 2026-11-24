@@ -23,9 +23,64 @@
     }
   }
 
-  /** Fetch JSON and surface server-reported errors instead of silently succeeding. */
-  async function request(url, options) {
-    const response = await fetch(url, options);
+  /* The API token, when the instance is configured with one.
+   *
+   * Held in sessionStorage rather than a cookie: a cookie would be attached to
+   * cross-site requests automatically, which is exactly the property that makes
+   * CSRF possible. This is sent explicitly, and only by this page.
+   */
+  const TOKEN_KEY = "threat-detector-token";
+
+  // "sessions" in flow mode, "packets" in packet mode; set from /api/summary.
+  let unitLabel = "rows";
+
+  function storedToken() {
+    try {
+      return sessionStorage.getItem(TOKEN_KEY) || null;
+    } catch (err) {
+      return null; // private mode, or storage disabled
+    }
+  }
+
+  function rememberToken(token) {
+    try {
+      sessionStorage.setItem(TOKEN_KEY, token);
+    } catch (err) {
+      /* not fatal: the token just will not survive a reload */
+    }
+  }
+
+  function askForToken() {
+    const token = window.prompt(
+      "This instance requires an API token (API_TOKEN on the server)."
+    );
+    if (token) rememberToken(token.trim());
+    return token ? token.trim() : null;
+  }
+
+  /** Fetch JSON and surface server-reported errors instead of silently succeeding.
+   *
+   * The X-Requested-With header is required by the server on state-changing
+   * requests: it forces a CORS preflight, which a cross-origin page cannot
+   * satisfy, so a site the operator visits cannot POST to this service.
+   */
+  async function request(url, options, retrying) {
+    const settings = Object.assign({}, options);
+    settings.headers = Object.assign(
+      { "X-Requested-With": "threat-detector" },
+      settings.headers || {}
+    );
+    const token = storedToken();
+    if (token) settings.headers["X-API-Token"] = token;
+
+    const response = await fetch(url, settings);
+
+    // 401 means a token is configured and ours is missing or stale. Ask once,
+    // then retry; a second failure is a wrong token, not a missing one.
+    if (response.status === 401 && !retrying && askForToken()) {
+      return request(url, options, true);
+    }
+
     let payload = {};
     try {
       payload = await response.json();
@@ -54,16 +109,28 @@
     }
   }
 
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  /** Training is a background job, so the POST only starts it. */
   async function trainModel() {
     setBusy(true);
-    setMessage("Training…", "info");
+    setMessage("Starting training…", "info");
     try {
-      const data = await request("/api/train", { method: "POST" });
-      setMessage(
-        `${data.message} Fitted on ${data.rows_trained} packets ` +
-          `(${data.n_estimators} trees, contamination ${data.contamination}).`,
-        "success"
-      );
+      await request("/api/train", { method: "POST" });
+      const record = await pollTraining();
+      if (record.state === "failed") {
+        setMessage(record.error || "Training failed.", "error");
+      } else {
+        const result = record.result || {};
+        setMessage(
+          `Trained on ${result.rows_trained} rows from ${result.fitted_on}. ` +
+            (result.fitted_on_baseline
+              ? `Threshold ${result.threshold}.`
+              : "Fitted on the traffic being inspected — set BASELINE_FILE to " +
+                "known-good traffic for real detection."),
+          result.fitted_on_baseline ? "success" : "info"
+        );
+      }
     } catch (err) {
       setMessage(err.message, "error");
     } finally {
@@ -72,7 +139,21 @@
     }
   }
 
-  let unitLabel = "rows";
+  /** Poll until the job leaves the running state, backing off as it goes. */
+  async function pollTraining() {
+    let delay = 250;
+    const deadline = Date.now() + 10 * 60 * 1000;
+    while (Date.now() < deadline) {
+      await sleep(delay);
+      delay = Math.min(delay * 1.5, 3000);
+      const status = await request("/api/status");
+      const training = status.training || {};
+      if (training.state !== "running") return training;
+      const elapsed = Math.round((Date.now() - training.started_at * 1000) / 1000);
+      setMessage(`Training… (${elapsed}s)`, "info");
+    }
+    throw new Error("Training is taking unusually long — check the server log.");
+  }
 
   function renderAnomalies(data) {
     const container = $("results");

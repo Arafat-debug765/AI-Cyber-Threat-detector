@@ -1,3 +1,7 @@
+from tests.conftest import train_and_wait
+from threat_detector import jobs
+
+
 def test_home_page_renders(client):
     response = client.get("/")
     assert response.status_code == 200
@@ -8,10 +12,26 @@ def test_health(client):
     assert client.get("/health").get_json() == {"status": "ok"}
 
 
-def test_train_without_dataset_returns_400(client):
-    response = client.post("/api/train")
-    assert response.status_code == 400
-    assert "not found" in response.get_json()["error"]
+def test_train_without_dataset_fails_the_job(client):
+    """The request is accepted; the failure surfaces in the job record."""
+    record = train_and_wait(client)
+    assert record["state"] == "failed"
+    assert "not found" in record["error"]
+
+
+def test_training_is_asynchronous(client, dataset):
+    """A capture worth analysing takes longer than an HTTP timeout."""
+    accepted = client.post("/api/train")
+    assert accepted.status_code == 202
+    assert accepted.get_json()["poll"] == "/api/status"
+    assert jobs.wait(client.application.config["APP_CONFIG"])["state"] == "succeeded"
+
+
+def test_status_reports_the_training_job(client, dataset):
+    train_and_wait(client)
+    payload = client.get("/api/status").get_json()
+    assert payload["training"]["state"] == "succeeded"
+    assert payload["model_usable"] is True
 
 
 def test_anomalies_before_training_returns_409(client, dataset):
@@ -21,9 +41,9 @@ def test_anomalies_before_training_returns_409(client, dataset):
 
 
 def test_full_train_then_detect_flow(client, dataset):
-    train = client.post("/api/train")
-    assert train.status_code == 200
-    assert train.get_json()["rows_trained"] == 200
+    record = train_and_wait(client)
+    assert record["state"] == "succeeded"
+    assert record["result"]["rows_trained"] == 200
 
     detect = client.get("/api/anomalies")
     assert detect.status_code == 200
@@ -38,7 +58,7 @@ def test_limit_must_be_positive(client, dataset):
 
 
 def test_legacy_endpoints_still_work(client, dataset):
-    assert client.post("/train").status_code == 200
+    train_and_wait(client, "/train")
     assert client.get("/anomalies").status_code == 200
 
 
@@ -61,8 +81,8 @@ def test_wrong_method_returns_405_not_500(client):
 
 def test_errors_do_not_leak_absolute_paths(client, dataset):
     """The API is unauthenticated; responses must not disclose host paths."""
-    body = client.post("/api/train").get_data(as_text=True)
-    assert "/Users/" not in body and "/home/" not in body
+    record = train_and_wait(client)
+    assert "/Users/" not in str(record) and "/home/" not in str(record)
 
     status = client.get("/api/status").get_json()
     assert not status["model_path"].startswith("/")
@@ -74,7 +94,7 @@ def test_errors_do_not_leak_absolute_paths(client, dataset):
 
 def test_summary_endpoint(client, dataset):
     assert client.get("/api/summary").status_code == 409  # not trained yet
-    client.post("/api/train")
+    train_and_wait(client)
 
     payload = client.get("/api/summary").get_json()
     assert payload["total_packets"] == 200

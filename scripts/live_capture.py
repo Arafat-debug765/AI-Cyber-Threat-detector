@@ -3,7 +3,7 @@
 
 Requires scapy and elevated privileges (packet capture needs raw sockets):
 
-    sudo python scripts/capture_packets.py --count 500 --iface en0
+    sudo python scripts/live_capture.py --count 500 --iface en0
 
 Only capture traffic on networks you own or are authorised to monitor.
 """
@@ -17,7 +17,7 @@ from pathlib import Path
 
 FIELDS = ["timestamp", "src_ip", "dst_ip", "src_port", "dst_port", "protocol",
           "packet_length"]
-DEFAULT_OUTPUT = Path(__file__).resolve().parent.parent / "data" / "packets.csv"
+DEFAULT_OUTPUT = Path("data") / "packets.csv"  # relative to where you run it
 
 
 def capture(output: Path, count: int, iface: str | None, bpf_filter: str) -> None:

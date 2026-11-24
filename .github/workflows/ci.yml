@@ -7,12 +7,20 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        # 3.9 is the declared floor; 3.12 is what it should actually run on.
-        python-version: ["3.9", "3.12"]
+        # 3.9 is the declared floor because it is what macOS's system Python
+        # still provides. It is end-of-life, and ubuntu-latest (26.04) no
+        # longer ships it, so that one job pins the newest image that does.
+        include:
+          - python-version: "3.9"
+            os: ubuntu-24.04
+          - python-version: "3.12"
+            os: ubuntu-latest
+          - python-version: "3.13"
+            os: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
@@ -22,20 +30,61 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
 
-      - name: Install dependencies
-        run: pip install -r requirements-dev.txt
+      - name: Install
+        run: pip install -e '.[all]'
 
       - name: Lint
         run: ruff check .
 
       - name: Test
-        run: pytest -q
+        run: pytest
 
-      - name: End-to-end detection check
+      - name: Detection quality gate
         # Guards the property the whole design rests on: attacks in the capture
-        # are found, and a clean capture raises nothing.
+        # are found, and a clean capture raises nothing. Unit tests cannot tell
+        # you the detector got worse.
         run: |
-          python scripts/generate_packets.py --output data/attacks.csv
-          python scripts/generate_packets.py --output data/clean.csv --no-attacks
-          BASELINE_FILE=data/clean.csv DATA_FILE=data/attacks.csv \
-            python scripts/check_detection.py
+          threat-detector generate --output data/attacks.csv
+          threat-detector generate --output data/clean.csv --no-attacks
+          threat-detector --data data/attacks.csv --baseline data/clean.csv selfcheck
+
+      - name: CLI smoke test
+        run: |
+          threat-detector --version
+          threat-detector --data data/attacks.csv --model data/m.pkl --baseline data/clean.csv train
+          threat-detector --data data/attacks.csv --model data/m.pkl inspect
+          threat-detector --data data/attacks.csv --model data/m.pkl detect --json > /dev/null
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build the wheel
+        run: |
+          pip install build
+          python -m build --wheel
+
+      - name: An installed copy works from any directory and writes nothing into itself
+        # Paths once resolved against the package's location, so an installed
+        # copy wrote the model and the signing key into site-packages. Editable
+        # installs hid it, because there the package location is the repo.
+        run: |
+          python -m venv /tmp/installed
+          /tmp/installed/bin/pip install dist/*.whl
+          mkdir /tmp/work && cd /tmp/work
+          export XDG_CONFIG_HOME=/tmp/work/config
+          /tmp/installed/bin/threat-detector --version
+          /tmp/installed/bin/threat-detector generate --output packets.csv
+          /tmp/installed/bin/threat-detector generate --output baseline.csv --no-attacks --seed 7
+          /tmp/installed/bin/threat-detector --data packets.csv --baseline baseline.csv selfcheck
+          SITE=$(/tmp/installed/bin/python -c "import threat_detector, pathlib; print(pathlib.Path(threat_detector.__file__).parent.parent)")
+          for leaked in models data .secrets; do
+            if [ -e "$SITE/$leaked" ]; then echo "::error::wrote $leaked into site-packages"; exit 1; fi
+          done
+          test -f models/model.pkl
+          test -f config/threat-detector/model_signing.key
+      - name: Build the container image
+        run: docker build -t ai-threat-detector:ci .

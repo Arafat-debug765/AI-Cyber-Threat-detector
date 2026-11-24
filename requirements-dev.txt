@@ -1,8 +1,0 @@
--r requirements.txt
-
-# Testing and tooling.
-pytest>=8.0
-ruff>=0.6
-
-# Live packet capture (scripts/capture_packets.py only; needs root to run).
-scapy>=2.5

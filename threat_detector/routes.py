@@ -6,9 +6,11 @@ import logging
 from flask import Blueprint, current_app, jsonify, render_template, request
 from werkzeug.exceptions import HTTPException
 
+from . import jobs
 from . import model as model_service
 from .features import DataError
 from .integrity import IntegrityError
+from .jobs import JobInProgress
 from .model import ModelNotTrained
 
 logger = logging.getLogger(__name__)
@@ -31,12 +33,27 @@ def health():
 
 @bp.route("/api/status")
 def status():
-    return jsonify(model_service.status(_config())), 200
+    config = _config()
+    payload = model_service.status(config)
+    payload["training"] = jobs.status(config)
+    return jsonify(payload), 200
 
 
 @bp.route("/api/train", methods=["POST"])
 def train():
-    return jsonify(model_service.train(_config())), 200
+    """Start a training run.
+
+    Returns 202 immediately rather than holding the connection open for the
+    whole fit: a capture large enough to be worth analysing takes longer than
+    any sane HTTP timeout. Poll /api/status for progress.
+    """
+    config = _config()
+    record = jobs.start(config, model_service.train)
+    return jsonify({
+        "message": "Training started.",
+        "training": record,
+        "poll": "/api/status",
+    }), 202
 
 
 @bp.route("/api/summary")
@@ -67,6 +84,11 @@ def handle_data_error(exc: DataError):
 @bp.app_errorhandler(IntegrityError)
 def handle_integrity_error(exc: IntegrityError):
     logger.error("Model integrity check failed: %s", exc)
+    return jsonify({"error": str(exc)}), 409
+
+
+@bp.app_errorhandler(JobInProgress)
+def handle_job_in_progress(exc: JobInProgress):
     return jsonify({"error": str(exc)}), 409
 
 

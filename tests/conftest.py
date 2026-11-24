@@ -4,11 +4,70 @@ import sys
 from pathlib import Path
 
 import pytest
+from flask.testing import FlaskClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app import create_app
-from app.config import Config
+from threat_detector import create_app, jobs
+from threat_detector.auth import CSRF_HEADER, CSRF_VALUE
+from threat_detector.config import Config
+
+
+class BrowserLikeClient(FlaskClient):
+    """A client that behaves like the app's own front end.
+
+    The real UI sends the anti-CSRF header on every request, so the default
+    test client does too. Tests that a *missing* header is rejected use a raw
+    client in test_auth.py instead.
+    """
+
+    def open(self, *args, **kwargs):
+        headers = dict(kwargs.pop("headers", None) or {})
+        headers.setdefault(CSRF_HEADER, CSRF_VALUE)
+        return super().open(*args, headers=headers, **kwargs)
+
+
+# Every setting Config reads from the environment. A developer's shell with
+# API_TOKEN or BASELINE_FILE exported must not change what the tests measure.
+_CONFIG_ENV = (
+    "DATA_FILE", "MODEL_FILE", "MODEL_KEY_FILE", "MODEL_SIGNING_KEY", "BASELINE_FILE",
+    "FEATURE_SET", "WINDOW_SECONDS", "MIN_SESSION_PACKETS", "MIN_WINDOW_COVERAGE",
+    "ALGORITHM", "N_ESTIMATORS",
+    "CONTAMINATION", "RANDOM_STATE", "CALIBRATION_QUANTILE", "SCORE_THRESHOLD",
+    "MAX_RESULTS", "FLASK_DEBUG", "API_TOKEN", "ALLOWED_HOSTS", "MAX_CONTENT_LENGTH",
+)
+
+
+@pytest.fixture(autouse=True)
+def hermetic_environment(tmp_path, monkeypatch):
+    """Give every test its own home, config directory and working directory.
+
+    Without this the suite was not hermetic: tests signed models with the
+    repository's real development key (found via the working directory), would
+    have written into the developer's actual ~/.config, and picked up whatever
+    configuration happened to be exported in the shell.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
+    for name in _CONFIG_ENV:
+        monkeypatch.delenv(name, raising=False)
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    monkeypatch.chdir(workdir)
+
+
+def train_and_wait(client, path: str = "/api/train", **kwargs) -> dict:
+    """POST to the training endpoint and block until the job finishes.
+
+    Training is asynchronous over HTTP, so a test that wants a trained model
+    has to wait for the worker rather than assume the response means "done".
+    """
+    response = client.post(path, **kwargs)
+    assert response.status_code == 202, response.get_data(as_text=True)
+    record = jobs.wait(client.application.config["APP_CONFIG"], timeout=60)
+    return record
 
 
 def write_packets(path: Path, rows: int = 200) -> Path:
@@ -110,6 +169,7 @@ def dataset(config) -> Path:
 def client(config):
     app = create_app(config)
     app.config.update(TESTING=True)
+    app.test_client_class = BrowserLikeClient
     with app.test_client() as test_client:
         yield test_client
 
@@ -123,5 +183,6 @@ def flow_dataset(flow_config) -> Path:
 def flow_client(flow_config):
     app = create_app(flow_config)
     app.config.update(TESTING=True)
+    app.test_client_class = BrowserLikeClient
     with app.test_client() as test_client:
         yield test_client

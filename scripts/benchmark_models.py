@@ -1,6 +1,15 @@
 #!/usr/bin/env python3
 """Benchmark anomaly-detection models on labelled synthetic traffic.
 
+NOTE — read before drawing conclusions. This benchmark fits each model on the
+same data it scores, which is *outlier* detection. The application fits on a
+clean baseline, which is *novelty* detection, and there the ranking reverses:
+IsolationForest's scores saturate at the edge of the training data while LOF's
+keep growing with distance, so with a baseline LOF found all four reference
+attacks in 700/700 trials against 695/700. This script is kept because the
+outlier setting is still what the no-baseline fallback does — see
+docs/ARCHITECTURE.md, "Choosing the detector".
+
 The app is unsupervised, but synthetic data has ground truth, so model choice
 can be measured instead of guessed. Two difficulty regimes are generated:
 
@@ -33,7 +42,7 @@ from sklearn.svm import OneClassSVM
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app.features import FEATURE_COLUMNS, build_features
+from threat_detector.features import FEATURE_COLUMNS, build_features
 
 NORMAL_PROTOCOLS = [1, 6, 17]
 ODD_PROTOCOLS = [47, 50, 89, 132]

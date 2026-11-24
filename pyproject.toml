@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-threat-detector"
+version = "1.0.0"
+description = "Unsupervised detection of anomalous behaviour in network captures"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.9"
+authors = [{ name = "Arafat-debug765" }]
+keywords = ["security", "network", "anomaly-detection", "isolation-forest", "nids"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Web Environment",
+    "Framework :: Flask",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security",
+    "Topic :: System :: Networking :: Monitoring",
+]
+
+dependencies = [
+    "flask>=3.0",
+    "pandas>=2.0",
+    "scikit-learn>=1.3",
+    "joblib>=1.3",
+]
+
+[project.optional-dependencies]
+# Reading .pcap files and capturing live traffic.
+capture = ["scapy>=2.5"]
+# A real WSGI server, for `threat-detector serve --production`.
+server = ["gunicorn>=21.0"]
+dev = ["pytest>=8.0", "ruff>=0.6"]
+all = ["ai-threat-detector[capture,server,dev]"]
+
+[project.scripts]
+threat-detector = "threat_detector.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/Arafat-debug765/AI-Cyber-Threat-detector"
+Issues = "https://github.com/Arafat-debug765/AI-Cyber-Threat-detector/issues"
+
+[tool.setuptools.packages.find]
+include = ["threat_detector*"]
+
+[tool.setuptools.package-data]
+threat_detector = ["templates/*.html", "static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-q"

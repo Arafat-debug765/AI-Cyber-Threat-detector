@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Generate a synthetic capture containing realistic attack behaviour.
 
 Baseline traffic is ordinary internal hosts talking to a handful of servers.
@@ -10,22 +9,22 @@ individual packet is unremarkable — only the pattern across packets is wrong:
   beacon      one source, one destination, rigidly regular interval
   exfil       one source, one external destination, sustained large payloads
 
-    python scripts/generate_packets.py --count 6000
-    python scripts/generate_packets.py --no-attacks     # clean baseline
+    threat-detector generate --count 6000
+    threat-detector generate --no-attacks     # clean baseline
 """
 from __future__ import annotations
 
-import argparse
 import csv
 import random
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-FIELDS = ["timestamp", "src_ip", "dst_ip", "src_port", "dst_port", "protocol", "packet_length"]
+from .features import CSV_FIELDS
+
+FIELDS = CSV_FIELDS
 TCP, UDP, ICMP = 6, 17, 1
 SERVERS = ["10.0.0.5", "10.0.0.6", "10.0.0.7"]
 SERVER_PORTS = [80, 443, 8080, 53]
-DEFAULT_OUTPUT = Path(__file__).resolve().parent.parent / "data" / "packets.csv"
 
 
 def _ts(start: datetime, offset: float) -> str:
@@ -114,9 +113,27 @@ ATTACKS = {
 }
 
 
-def generate(output: Path, count: int, hosts: int, seed: int, with_attacks: bool) -> None:
+def generate(
+    output: Path,
+    count: int,
+    hosts: int,
+    seed: int,
+    with_attacks: bool,
+    start: datetime | None = None,
+) -> None:
+    """Write a synthetic capture. The same seed always yields the same traffic.
+
+    `start` fixes the absolute time of the capture; by default it is fifteen
+    minutes ago, *floored to the second*. Timestamps are written at one-second
+    resolution, so an unfloored start let the sub-second part of the clock
+    decide how every packet's offset rounded: the same seed produced different
+    relative timings on each run (798 of 2,000 differed between two runs 0.37s
+    apart), which made the "seeded, reproducible" promise false and the
+    detection gate in CI quietly nondeterministic.
+    """
     rng = random.Random(seed)
-    start = datetime.now(timezone.utc) - timedelta(seconds=900)
+    if start is None:
+        start = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(seconds=900)
 
     rows = baseline(rng, start, count, hosts)
     planted = {}
@@ -138,27 +155,3 @@ def generate(output: Path, count: int, hosts: int, seed: int, with_attacks: bool
         print(f"     planted {name:<11} from {source} ({packets} packets)")
     if planted:
         print("     these are invisible per-packet; run with FEATURE_SET=flow (the default)")
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__,
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("-o", "--output", type=Path, default=DEFAULT_OUTPUT)
-    parser.add_argument("-c", "--count", type=int, default=6000,
-                        help="baseline packets, before attacks (default: 6000)")
-    parser.add_argument("--hosts", type=int, default=25, help="distinct benign sources")
-    parser.add_argument("-s", "--seed", type=int, default=42)
-    parser.add_argument("--no-attacks", action="store_true",
-                        help="clean baseline only — useful for checking the false-positive rate")
-    args = parser.parse_args()
-
-    if args.count < 1:
-        parser.error("--count must be at least 1")
-    if args.hosts < 1:
-        parser.error("--hosts must be at least 1")
-
-    generate(args.output, args.count, args.hosts, args.seed, not args.no_attacks)
-
-
-if __name__ == "__main__":
-    main()
