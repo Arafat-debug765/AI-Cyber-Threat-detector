@@ -5,7 +5,14 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-BASE_DIR = Path(__file__).resolve().parent.parent
+APP_NAME = "threat-detector"
+
+
+def user_config_dir() -> Path:
+    """Per-user configuration directory, honouring XDG_CONFIG_HOME."""
+    root = os.getenv("XDG_CONFIG_HOME")
+    base = Path(root).expanduser() if root else Path.home() / ".config"
+    return base / APP_NAME
 
 
 def _contamination(raw: str) -> float | str:
@@ -23,10 +30,19 @@ def _host_list(raw: str) -> tuple[str, ...]:
     return hosts or ("127.0.0.1",)
 
 
-def _env_path(name: str, default: str) -> Path:
-    """Resolve an env-provided path relative to the project root."""
-    value = Path(os.getenv(name, default)).expanduser()
-    return value if value.is_absolute() else BASE_DIR / value
+def _env_path(name: str, default: str | Path) -> Path:
+    """Resolve a path setting; relative paths mean the working directory.
+
+    These used to resolve against the package's own location. From a source
+    checkout that happened to be the repository, so it looked right — but an
+    installed copy lives in site-packages, and every relative default (the
+    capture, the model, and the signing key) was written *into the Python
+    installation*: shared by every user of it, invisible to the person who ran
+    the command, orphaned by `pip uninstall`, and a PermissionError on a system
+    Python. A command-line tool's relative paths mean "here".
+    """
+    value = Path(os.getenv(name) or default).expanduser()
+    return value if value.is_absolute() else Path.cwd() / value
 
 
 @dataclass(frozen=True)
@@ -40,8 +56,10 @@ class Config:
     # The key authenticating the model deliberately does not live beside it:
     # anything able to write the model could usually read a key in the same
     # directory, which would defeat the signature.
+    # Default: the user's config directory, outside any project tree, so the
+    # key cannot be committed with the code or shared through a data volume.
     key_file: Path = field(
-        default_factory=lambda: _env_path("MODEL_KEY_FILE", ".secrets/model_signing.key")
+        default_factory=lambda: _env_path("MODEL_KEY_FILE", user_config_dir() / "model_signing.key")
     )
 
     # "packet" scores each packet in isolation; "flow" aggregates packets into
@@ -58,11 +76,34 @@ class Config:
     min_session_packets: int = field(
         default_factory=lambda: int(os.getenv("MIN_SESSION_PACKETS", "3"))
     )
+    # Sessions from a window the capture spans for less than this fraction of
+    # its length are dropped. Only the last window can be partial (windows are
+    # anchored at the first packet), and a sliver of it once held sessions of
+    # three packets in the same second: zero inter-arrival, tiny volume, the
+    # most anomalous thing in the baseline — and the threshold calibrated on
+    # them hid all four reference attacks.
+    min_window_coverage: float = field(
+        default_factory=lambda: float(os.getenv("MIN_WINDOW_COVERAGE", "0.5"))
+    )
 
-    # Detection algorithm: "iforest" (default) or "lof". Benchmarked in
-    # scripts/benchmark_models.py — IsolationForest wins on globally-extreme
-    # anomalies, LOF on contextual ones. See README.
-    algorithm: str = field(default_factory=lambda: os.getenv("ALGORITHM", "iforest").lower())
+    # Detector: "auto" (default), "lof" or "iforest". `auto` picks by setting,
+    # and the choice was measured, not assumed:
+    #
+    #   flow mode -> LOF. Fitting on a clean baseline is *novelty* detection,
+    #     and LOF's distance-based score keeps growing as a session moves
+    #     further from anything normal. IsolationForest's does not: a session
+    #     at ten times the baseline maximum isolates like one *at* the maximum,
+    #     so an exfil moving 560 KB against a ~45 KB baseline scored as less
+    #     anomalous than an ordinary host. Across 700 trials with independent
+    #     recording times, LOF found all four reference attacks every time;
+    #     IsolationForest did so in 695.
+    #   packet mode -> IsolationForest, kept for comparison with the original
+    #     design, which is what its documented figures describe.
+    #
+    # An earlier benchmark preferred IsolationForest because it fitted on
+    # contaminated data, where LOF's weakness (a tight cluster of anomalies
+    # looks locally dense) applies. A clean baseline removes that weakness.
+    algorithm: str = field(default_factory=lambda: os.getenv("ALGORITHM", "auto").lower())
 
     # IsolationForest hyper-parameters.
     n_estimators: int = field(default_factory=lambda: int(os.getenv("N_ESTIMATORS", "100")))
@@ -131,7 +172,9 @@ class Config:
     # domain at this port.
     allowed_hosts: tuple[str, ...] = field(
         default_factory=lambda: _host_list(
-            os.getenv("ALLOWED_HOSTS", "127.0.0.1,localhost,[::1],0.0.0.0")
+            # Names a client puts in Host. 0.0.0.0 used to be listed too; it is
+            # a bind address, and no legitimate client ever sends it.
+            os.getenv("ALLOWED_HOSTS", "127.0.0.1,localhost,[::1]")
         )
     )
 
@@ -152,12 +195,25 @@ class Config:
             raise ValueError("WINDOW_SECONDS must be at least 1.")
         if self.min_session_packets < 0:
             raise ValueError("MIN_SESSION_PACKETS must be zero or positive.")
-        if self.algorithm not in {"iforest", "lof"}:
+        if self.algorithm not in {"auto", "iforest", "lof"}:
             raise ValueError(
-                f"Unknown ALGORITHM {self.algorithm!r}. Expected 'iforest' or 'lof'."
+                f"Unknown ALGORITHM {self.algorithm!r}. Expected 'auto', 'lof' or 'iforest'."
             )
+        if not 0.0 <= self.min_window_coverage < 1.0:
+            raise ValueError("MIN_WINDOW_COVERAGE must be in [0.0, 1.0).")
         if self.max_content_length < 1:
             raise ValueError("MAX_CONTENT_LENGTH must be positive.")
+
+    @property
+    def estimator(self) -> str:
+        """The detector actually used, with `auto` resolved by feature set.
+
+        Resolved on read rather than stored, so `replace(config,
+        feature_set=...)` re-resolves instead of carrying a stale choice.
+        """
+        if self.algorithm != "auto":
+            return self.algorithm
+        return "lof" if self.feature_set == "flow" else "iforest"
 
     @property
     def job_file(self) -> Path:
@@ -171,4 +227,6 @@ class Config:
     def ensure_dirs(self) -> None:
         self.data_file.parent.mkdir(parents=True, exist_ok=True)
         self.model_file.parent.mkdir(parents=True, exist_ok=True)
-        self.key_file.parent.mkdir(parents=True, exist_ok=True)
+        # Owner-only: the directory holding the signing key should not be
+        # listable by other accounts, even though the key itself is 0600.
+        self.key_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)

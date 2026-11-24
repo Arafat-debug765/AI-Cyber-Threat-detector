@@ -17,7 +17,7 @@ import logging
 
 import pandas as pd
 
-from .features import DataError, ip_to_int
+from .features import DROPPED_ATTR, DataError, clean_packets, rows_dropped
 
 logger = logging.getLogger(__name__)
 
@@ -41,22 +41,6 @@ FLOW_KEY_COLUMNS = ["src_ip", "window_start"]
 SMALL_PACKET_BYTES = 100
 
 
-def _parse_timestamps(df: pd.DataFrame) -> pd.Series:
-    if "timestamp" not in df.columns:
-        raise DataError(
-            "Flow features need a 'timestamp' column. Either add one or run with "
-            "FEATURE_SET=packet."
-        )
-    stamps = pd.to_datetime(df["timestamp"], errors="coerce", utc=True, format="mixed")
-    if stamps.isna().all():
-        raise DataError("No parsable values in the 'timestamp' column.")
-    if stamps.isna().any():
-        raise DataError(
-            f"{int(stamps.isna().sum())} row(s) have an unparsable timestamp."
-        )
-    return stamps
-
-
 def _is_external(address: str) -> bool:
     """True when the address is outside RFC1918 space."""
     try:
@@ -66,12 +50,18 @@ def _is_external(address: str) -> bool:
 
 
 def build_flow_features(
-    df: pd.DataFrame, window_seconds: int = 60, min_packets: int = 0
+    df: pd.DataFrame,
+    window_seconds: int = 60,
+    min_packets: int = 0,
+    min_coverage: float = 0.0,
 ) -> pd.DataFrame:
     """Aggregate packets into per-source, per-window behavioural sessions.
 
-    Returns a frame whose index is a RangeIndex and which carries both the
-    identity columns (src_ip, window_start) and FLOW_FEATURE_COLUMNS.
+    Accepts raw packet rows; anything that cannot be analysed is dropped by
+    `clean_packets`, and the counts travel on `.attrs` with the result.
+
+    Returns a frame with a RangeIndex carrying the identity columns
+    (src_ip, window_start) and FLOW_FEATURE_COLUMNS.
 
     `min_packets` drops windows too small to describe behaviour. A window
     holding one packet — which is what the first and last window of any capture
@@ -82,28 +72,43 @@ def build_flow_features(
     if window_seconds < 1:
         raise DataError("window_seconds must be at least 1.")
 
+    clean = clean_packets(df, require_timestamps=True)
+    dropped = rows_dropped(clean)
+
     work = pd.DataFrame({
-        "src_ip": df["src_ip"].astype(str),
-        "dst_ip": df["dst_ip"].astype(str),
-        "protocol": pd.to_numeric(df["protocol"], errors="coerce"),
-        "packet_length": pd.to_numeric(df["packet_length"], errors="coerce"),
-        "timestamp": _parse_timestamps(df),
+        "src_ip": clean["src_ip"].astype(str).str.strip(),
+        "dst_ip": clean["dst_ip"].astype(str).str.strip(),
+        "protocol": clean["protocol"],
+        "packet_length": clean["packet_length"],
+        "timestamp": clean["_ts"],
+        # Ports are optional: captures without a transport layer have none,
+        # and distinct_dst_ports then degenerates to a constant.
+        "dst_port": (pd.to_numeric(clean["dst_port"], errors="coerce").fillna(0)
+                     if "dst_port" in clean.columns else 0),
     })
-    # Ports are optional: captures without a transport layer simply have none,
-    # and distinct_dst_ports then degenerates to a constant rather than failing.
-    work["dst_port"] = (
-        pd.to_numeric(df["dst_port"], errors="coerce") if "dst_port" in df.columns else 0
-    )
     work["external_dst"] = work["dst_ip"].map(_is_external)
     work["small_packet"] = work["packet_length"] < SMALL_PACKET_BYTES
+    # Windows are anchored at the capture's first packet, not the wall clock.
+    # Flooring to clock boundaries meant a capture that began at 03:54:58 got
+    # a two-second first window: every host contributed a sliver session of a
+    # few packets, those slivers scored as the most anomalous thing in the
+    # baseline, and the threshold calibrated on them sat below three of the
+    # four reference attacks. The same traffic recorded a minute later was
+    # analysed correctly. Results must not depend on the time of day a capture
+    # happened to start.
+    width = pd.Timedelta(seconds=window_seconds)
+    origin = work["timestamp"].min()
+    work["window_start"] = origin + ((work["timestamp"] - origin) // width) * width
+    end = work["timestamp"].max()
 
-    if work[["protocol", "packet_length"]].isna().any().any():
-        raise DataError("Non-numeric protocol/packet_length values in the dataset.")
+    keys = ["src_ip", "window_start"]
+    work = work.sort_values([*keys, "timestamp"], kind="stable")
+    # Gap to the previous packet *within the same session*: vectorised, rather
+    # than calling a Python function once per session, which dominated runtime
+    # on captures with many short sessions.
+    work["gap"] = work.groupby(keys, sort=False)["timestamp"].diff().dt.total_seconds()
 
-    work["window_start"] = work["timestamp"].dt.floor(f"{window_seconds}s")
-    work = work.sort_values("timestamp")
-
-    grouped = work.groupby(["src_ip", "window_start"], sort=True)
+    grouped = work.groupby(keys, sort=True)
     features = grouped.agg(
         packets=("packet_length", "size"),
         bytes_total=("packet_length", "sum"),
@@ -114,23 +119,34 @@ def build_flow_features(
         distinct_protocols=("protocol", "nunique"),
         small_packet_ratio=("small_packet", "mean"),
         external_dst_ratio=("external_dst", "mean"),
+        mean_interarrival=("gap", "mean"),
     )
-
-    gaps = grouped["timestamp"].apply(_interarrival_stats)
-    features["mean_interarrival"] = gaps.map(lambda pair: pair[0])
-    features["std_interarrival"] = gaps.map(lambda pair: pair[1])
+    # Population deviation (ddof=0): a two-packet session has one gap and
+    # therefore zero spread, not an undefined one.
+    features["std_interarrival"] = grouped["gap"].std(ddof=0)
 
     # A single-packet window has no spread and no gap; zero is the honest value,
     # and NaN would silently drop the row at fit time.
     features = features.fillna(0.0).reset_index()
-    features["src_ip_int"] = features["src_ip"].map(ip_to_int)
+
+    if min_coverage > 0:
+        # How much of each window the capture actually spans. Anchoring makes
+        # every window complete except possibly the last; a session from a
+        # window the capture covers for two seconds describes two seconds of
+        # behaviour and is not comparable with five minutes of it.
+        covered = ((end - features["window_start"]).clip(upper=width) / width).clip(lower=0)
+        partial = covered < min_coverage
+        # A capture shorter than one window is *all* partial window; keep it.
+        if partial.any() and not partial.all():
+            logger.info("Ignored %d session(s) in a window the capture covers "
+                        "for under %.0f%% of its length", int(partial.sum()), min_coverage * 100)
+            features = features[~partial].reset_index(drop=True)
 
     if min_packets > 1:
         keep = features["packets"] >= min_packets
-        dropped = int((~keep).sum())
-        if dropped:
-            logger.info("Ignored %d session(s) with fewer than %d packets",
-                        dropped, min_packets)
+        tiny = int((~keep).sum())
+        if tiny:
+            logger.info("Ignored %d session(s) with fewer than %d packets", tiny, min_packets)
         features = features[keep].reset_index(drop=True)
         if features.empty:
             raise DataError(
@@ -138,19 +154,9 @@ def build_flow_features(
                 "MIN_SESSION_PACKETS, or widen WINDOW_SECONDS so sessions "
                 "gather enough traffic to describe behaviour."
             )
+
+    features.attrs[DROPPED_ATTR] = dropped
     return features
-
-
-def _interarrival_stats(stamps: pd.Series) -> tuple[float, float]:
-    """Mean and standard deviation of gaps between packets, in seconds.
-
-    A low std with a non-trivial mean is the signature of beaconing: machine
-    timers are regular in a way human-driven traffic is not.
-    """
-    if len(stamps) < 2:
-        return (0.0, 0.0)
-    gaps = stamps.sort_values().diff().dt.total_seconds().dropna()
-    return (float(gaps.mean()), float(gaps.std(ddof=0)))
 
 
 def flow_matrix(features: pd.DataFrame) -> pd.DataFrame:

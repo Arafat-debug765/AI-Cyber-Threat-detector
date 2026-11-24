@@ -19,13 +19,12 @@ import random
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from .config import BASE_DIR
+from .features import CSV_FIELDS
 
-FIELDS = ["timestamp", "src_ip", "dst_ip", "src_port", "dst_port", "protocol", "packet_length"]
+FIELDS = CSV_FIELDS
 TCP, UDP, ICMP = 6, 17, 1
 SERVERS = ["10.0.0.5", "10.0.0.6", "10.0.0.7"]
 SERVER_PORTS = [80, 443, 8080, 53]
-DEFAULT_OUTPUT = BASE_DIR / "data" / "packets.csv"
 
 
 def _ts(start: datetime, offset: float) -> str:
@@ -114,9 +113,27 @@ ATTACKS = {
 }
 
 
-def generate(output: Path, count: int, hosts: int, seed: int, with_attacks: bool) -> None:
+def generate(
+    output: Path,
+    count: int,
+    hosts: int,
+    seed: int,
+    with_attacks: bool,
+    start: datetime | None = None,
+) -> None:
+    """Write a synthetic capture. The same seed always yields the same traffic.
+
+    `start` fixes the absolute time of the capture; by default it is fifteen
+    minutes ago, *floored to the second*. Timestamps are written at one-second
+    resolution, so an unfloored start let the sub-second part of the clock
+    decide how every packet's offset rounded: the same seed produced different
+    relative timings on each run (798 of 2,000 differed between two runs 0.37s
+    apart), which made the "seeded, reproducible" promise false and the
+    detection gate in CI quietly nondeterministic.
+    """
     rng = random.Random(seed)
-    start = datetime.now(timezone.utc) - timedelta(seconds=900)
+    if start is None:
+        start = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(seconds=900)
 
     rows = baseline(rng, start, count, hosts)
     planted = {}

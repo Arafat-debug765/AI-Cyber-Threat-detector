@@ -13,8 +13,8 @@ from sklearn.neighbors import LocalOutlierFactor
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
-from .config import BASE_DIR, Config
-from .features import build_features, load_packets
+from .config import Config
+from .features import DataError, build_features, clean_packets, load_packets, rows_dropped
 from .integrity import IntegrityError, dump_signed, load_signed, signing_key
 from .sessions import build_flow_features, flow_matrix
 
@@ -45,6 +45,8 @@ def _fingerprint(config: Config) -> tuple:
         config.feature_set,
         config.window_seconds,
         config.min_session_packets,
+        config.min_window_coverage,
+        config.estimator,
         config.score_threshold,
     )
 
@@ -87,9 +89,16 @@ BUNDLE_VERSION = 2
 # never fire. Fall back to a small quota and say so.
 FALLBACK_QUANTILE = 0.02
 
-# Default target false-positive rate against the baseline. Measured, not
-# guessed — see the comment on Config.calibration_quantile.
-DEFAULT_FALSE_POSITIVE_RATE = 0.02
+# Default calibration quantile with a baseline: 0.0, i.e. the threshold is the
+# least typical baseline session, scored out-of-fold. Measured on independent
+# clean captures (not the baseline itself — that is in-sample and flatters any
+# setting): 0.0 found all four reference attacks in 200/200 trials with a
+# 1.5% false-alarm rate, and no false alarms at all on 59% of captures.
+# 0.02 found the same attacks at a 2.7% false-alarm rate. Under the earlier
+# IsolationForest default the trade-off ran the other way, because its scores
+# saturate at the edge of the baseline; LOF's keep growing, so the strictest
+# setting no longer costs recall.
+DEFAULT_FALSE_POSITIVE_RATE = 0.0
 
 # How far below the rest of the baseline a single session has to sit before we
 # treat it as an artifact rather than a data point. Expressed in units of the
@@ -109,6 +118,26 @@ def _calibration_quantile(config: Config) -> float:
         FALLBACK_QUANTILE * 100,
     )
     return FALLBACK_QUANTILE
+
+
+CALIBRATION_FOLDS = 5
+
+
+def _out_of_fold_scores(config: Config, features: pd.DataFrame) -> np.ndarray:
+    """Score every row with a model fitted on the other folds.
+
+    Deterministic (seeded by RANDOM_STATE), so the same baseline always yields
+    the same threshold.
+    """
+    n = len(features)
+    folds = min(CALIBRATION_FOLDS, n)
+    order = np.random.default_rng(config.random_state).permutation(n)
+    scores = np.empty(n, dtype=float)
+    for k in range(folds):
+        held_out = order[k::folds]
+        fitted = build_estimator(config).fit(features.iloc[np.setdiff1d(order, held_out)])
+        scores[held_out] = fitted.decision_function(features.iloc[held_out])
+    return scores
 
 
 def _warn_if_threshold_is_set_by_an_outlier(scores, quantile: float, threshold: float) -> None:
@@ -147,9 +176,12 @@ def load_for_model(config: Config, path: Path | None = None) -> tuple[pd.DataFra
     """
     df = load_packets(path or config.data_file)
     if config.feature_set == "flow":
-        flows = build_flow_features(df, config.window_seconds, config.min_session_packets)
+        flows = build_flow_features(df, config.window_seconds, config.min_session_packets,
+                                    config.min_window_coverage)
         return flows, flow_matrix(flows)
-    return df, build_features(df)
+    clean = clean_packets(df)
+    features = build_features(clean)
+    return clean, features
 
 
 def build_estimator(config: Config):
@@ -160,7 +192,7 @@ def build_estimator(config: Config):
     wider range than protocol — so it is wrapped in a scaling pipeline.
     `novelty=True` is what makes a LOF model persistable and reusable at all.
     """
-    if config.algorithm == "lof":
+    if config.estimator == "lof":
         return Pipeline([
             ("scale", StandardScaler()),
             ("lof", LocalOutlierFactor(
@@ -177,6 +209,15 @@ def build_estimator(config: Config):
     )
 
 
+MIN_FIT_ROWS = 10
+
+# Below this many baseline sessions, false alarms are measurably higher. On the
+# reference data: ~50 sessions -> 0.99 false alerts per clean capture, ~100 ->
+# 0.44, ~200 -> 0.21, with every attack still found. Worth saying at training
+# time, when the operator can still record a longer baseline.
+RECOMMENDED_BASELINE_SESSIONS = 100
+
+
 def train(config: Config) -> dict:
     """Fit the detector and calibrate its alert threshold.
 
@@ -187,21 +228,34 @@ def train(config: Config) -> dict:
     itself. The response says which file was used.
     """
     fit_path = config.baseline_file or config.data_file
-    _, features = load_for_model(config, fit_path)
+    fit_rows, features = load_for_model(config, fit_path)
+    if len(features) < MIN_FIT_ROWS:
+        unit = "sessions" if config.feature_set == "flow" else "packets"
+        raise DataError(
+            f"Only {len(features)} {unit} to learn from in '{Path(fit_path).name}'; "
+            f"need at least {MIN_FIT_ROWS}. Use a longer capture"
+            + (", or a shorter WINDOW_SECONDS." if config.feature_set == "flow" else ".")
+        )
     model = build_estimator(config)
     model.fit(features)
 
-    # Calibrate on the training scores: raw scores are only comparable within a
-    # single fitted model, so a hard-coded threshold would drift with the data.
-    training_scores = model.decision_function(features)
+    # Calibrate on *out-of-fold* scores: each baseline session scored by a
+    # model that never saw it. Scoring the training data itself is biased
+    # toward "normal" — a novelty model has every training point as its own
+    # neighbour — so a threshold set on in-sample scores is too tight, and
+    # ordinary new traffic crosses it. Measured on independent clean
+    # captures, in-sample calibration let some captures raise 17 false alerts
+    # out of 50 sessions; the out-of-fold threshold is what new data actually
+    # looks like.
+    calibration_scores = _out_of_fold_scores(config, features)
     quantile = _calibration_quantile(config)
-    threshold = float(np.quantile(training_scores, quantile))
-    _warn_if_threshold_is_set_by_an_outlier(training_scores, quantile, threshold)
+    threshold = float(np.quantile(calibration_scores, quantile))
+    _warn_if_threshold_is_set_by_an_outlier(calibration_scores, quantile, threshold)
 
     bundle = {
         "version": BUNDLE_VERSION,
         "model": model,
-        "algorithm": config.algorithm,
+        "algorithm": config.estimator,
         "feature_set": config.feature_set,
         "window_seconds": config.window_seconds,
         "min_session_packets": config.min_session_packets,
@@ -215,12 +269,26 @@ def train(config: Config) -> dict:
     dump_signed(bundle, config.model_file, _key(config))
     clear_cache()
     logger.info("Trained %s/%s on %d rows from %s (threshold %.6f), saved to %s",
-                config.algorithm, config.feature_set, len(features), fit_path,
+                config.estimator, config.feature_set, len(features), fit_path,
                 threshold, config.model_file)
+
+    short_baseline = (config.baseline_file is not None and config.feature_set == "flow"
+                      and len(features) < RECOMMENDED_BASELINE_SESSIONS)
+    if short_baseline:
+        logger.warning(
+            "The baseline has %d sessions. False alarms fall as it grows — "
+            "roughly halving each time it doubles — so aim for at least %d "
+            "(about %d minutes of traffic per host at WINDOW_SECONDS=%d).",
+            len(features), RECOMMENDED_BASELINE_SESSIONS,
+            max(1, RECOMMENDED_BASELINE_SESSIONS * config.window_seconds
+                // max(1, fit_rows["src_ip"].nunique()) // 60),
+            config.window_seconds,
+        )
 
     summary = {
         "message": "Model trained successfully.",
-        "algorithm": config.algorithm,
+        "short_baseline": short_baseline,
+        "algorithm": config.estimator,
         "feature_set": config.feature_set,
         "rows_trained": len(features),
         "features": list(features.columns),
@@ -230,8 +298,9 @@ def train(config: Config) -> dict:
         "fitted_on": _public_path(fit_path),
         "fitted_on_baseline": config.baseline_file is not None,
         "model_path": _public_path(config.model_file),
+        "rows_dropped": rows_dropped(fit_rows),
     }
-    if config.algorithm == "iforest":
+    if config.estimator == "iforest":
         summary["n_estimators"] = config.n_estimators
     return summary
 
@@ -261,7 +330,7 @@ def load_model(config: Config) -> dict:
     # about.
     for setting, current in (
         ("feature_set", config.feature_set),
-        ("algorithm", config.algorithm),
+        ("algorithm", config.estimator),
     ):
         if bundle.get(setting) != current:
             raise ModelNotTrained(
@@ -301,6 +370,7 @@ def detect(config: Config, limit: int | None = None) -> dict:
         "returned": min(total_flagged, cap),
         "truncated": truncated,
         "total_packets": len(results),
+        "rows_dropped": rows_dropped(raw),
     }
 
 
@@ -340,6 +410,7 @@ def summarize(config: Config) -> dict:
         "max_score": round(float(frame["score"].max()), 6),
         "score_histogram": _score_histogram(frame),
         "protocols": _group_breakdown(frame, breakdown_label),
+        "rows_dropped": rows_dropped(raw),
     }
 
 
@@ -406,7 +477,7 @@ def status(config: Config) -> dict:
         "dataset_present": data_path.exists(),
         "dataset_path": _public_path(data_path),
         "feature_set": config.feature_set,
-        "algorithm": config.algorithm,
+        "algorithm": config.estimator,
         "window_seconds": config.window_seconds,
         "fitted_on_baseline": config.baseline_file is not None,
         "trained_at": (
@@ -433,13 +504,14 @@ def status(config: Config) -> dict:
 
 
 def _public_path(path: Path) -> str:
-    """A path safe to hand to a client: relative to the project root if possible.
+    """A path safe to hand to a client: relative to the working directory, or
+    just the file name.
 
-    The API is unauthenticated, so absolute paths in responses would disclose
-    the host account name and directory layout. Logs keep the full path.
+    Absolute paths in responses would disclose the host account name and
+    directory layout to anyone holding an API token. Logs keep the full path.
     """
     try:
-        return str(Path(path).relative_to(BASE_DIR))
+        return str(Path(path).resolve().relative_to(Path.cwd().resolve()))
     except ValueError:
         return Path(path).name
 
