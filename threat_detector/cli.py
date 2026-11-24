@@ -49,7 +49,12 @@ def cmd_generate(args, config: Config) -> int:
 
 def cmd_ingest(args, config: Config) -> int:
     result = pcap.convert(args.capture, args.output or config.data_file, args.limit)
-    print(f"[OK] Wrote {result['packets']} packets to {result['output']} "
+    if result["truncated_bytes"]:
+        print(f"[WARNING] {args.capture.name} is truncated or corrupt: "
+              f"{result['truncated_bytes']} bytes after the last readable packet "
+              "were skipped.", file=sys.stderr)
+    print(f"[{'PARTIAL' if result['truncated_bytes'] else 'OK'}] Wrote "
+          f"{result['packets']} packets to {result['output']} "
           f"({result['skipped']} non-IPv4 packets skipped)")
     return 0
 
@@ -63,6 +68,11 @@ def cmd_train(args, config: Config) -> int:
           f"{summary['rows_trained']} rows from {summary['fitted_on']}")
     print(f"Alert threshold: {summary['threshold']} "
           f"(quantile {summary['calibration_quantile']})")
+    if summary.get("short_baseline"):
+        print(f"\nNote: the baseline has only {summary['rows_trained']} sessions. Every "
+              "attack is still found, but false alarms roughly halve each time the "
+              "baseline doubles — record a longer known-good capture if you can.",
+              file=sys.stderr)
     if not summary["fitted_on_baseline"]:
         print("\nWarning: fitted on the traffic being inspected. Point --baseline "
               "at known-good traffic for real detection.", file=sys.stderr)
