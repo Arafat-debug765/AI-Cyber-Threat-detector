@@ -157,3 +157,23 @@ def test_oversized_body_is_refused(raw_client):
 )
 def test_is_loopback(host, expected):
     assert is_loopback(host) is expected
+
+
+def test_healthcheck_survives_a_restricted_host_list(config):
+    """A container's probe hits 127.0.0.1, whatever domain it serves.
+
+    Host-checking /health made the Docker healthcheck fail permanently once
+    ALLOWED_HOSTS named the real domain, and the orchestrator restart-looped it.
+    """
+    app = create_app(replace(config, allowed_hosts=("detector.example.com",)))
+    app.config.update(TESTING=True)
+    with app.test_client() as client:
+        assert client.get("/health", headers={"Host": "127.0.0.1:5000"}).status_code == 200
+        # The exemption is for the probe only; data endpoints stay protected.
+        assert client.get("/api/status", headers={"Host": "127.0.0.1:5000"}).status_code == 403
+
+
+def test_bind_address_is_not_an_allowed_host():
+    from threat_detector.config import Config
+
+    assert "0.0.0.0" not in Config().allowed_hosts

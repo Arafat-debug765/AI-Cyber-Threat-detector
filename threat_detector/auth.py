@@ -64,10 +64,17 @@ def _presented_token() -> str | None:
     return request.headers.get("X-API-Token") or None
 
 
+# Liveness probes come from the orchestrator over loopback, with whatever Host
+# it chooses. /health returns nothing worth rebinding for, and checking its
+# Host made a container whose ALLOWED_HOSTS named its public domain fail its
+# own healthcheck forever — and get restarted in a loop.
+_HOST_EXEMPT_PATHS = frozenset({"/health"})
+
+
 def check_host() -> object | None:
     """Reject requests whose Host header this instance does not answer to."""
     allowed = _config().allowed_hosts
-    if "*" in allowed:
+    if "*" in allowed or request.path in _HOST_EXEMPT_PATHS:
         return None
 
     # Strip the port: Host is "example.com:5000", and ":5000" is not identity.
