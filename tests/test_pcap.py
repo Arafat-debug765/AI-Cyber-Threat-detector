@@ -122,3 +122,18 @@ def test_limit_stops_early_without_claiming_truncation(capture, tmp_path):
 def test_missing_capture(tmp_path):
     with pytest.raises(pcap.PcapError, match="not found"):
         pcap.convert(tmp_path / "absent.pcap", tmp_path / "out.csv")
+
+
+def test_a_rejected_capture_does_not_leak_a_file_handle(tmp_path):
+    """scapy raises from its constructor without closing the file it opened."""
+    import gc
+    import warnings
+
+    junk = tmp_path / "junk.pcap"
+    junk.write_bytes(b"not a capture")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with pytest.raises(pcap.PcapError):
+            pcap.convert(junk, tmp_path / "out.csv")
+        gc.collect()
+    assert not [w for w in caught if issubclass(w.category, ResourceWarning)]

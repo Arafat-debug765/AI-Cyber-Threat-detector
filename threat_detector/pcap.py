@@ -58,7 +58,11 @@ def convert(source: Path, output: Path, limit: int | None = None) -> dict:
     interrupted: str | None = None
 
     try:
-        with PcapReader(str(source)) as packets, scratch.open("w", newline="") as handle:
+        # Open the capture ourselves rather than passing scapy a path: when
+        # scapy rejects a file it raises from its constructor without closing
+        # the handle it opened, leaking one descriptor per failed ingest.
+        with source.open("rb") as raw, PcapReader(raw) as packets, \
+                scratch.open("w", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=FIELDS)
             writer.writeheader()
 

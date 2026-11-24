@@ -1,5 +1,6 @@
 [build-system]
-requires = ["setuptools>=68"]
+# 77+ for PEP 639 license metadata, which setuptools will require from 2027-02-18.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,7 +8,8 @@ name = "ai-threat-detector"
 version = "1.0.0"
 description = "Unsupervised detection of anomalous behaviour in network captures"
 readme = "README.md"
-license = { file = "LICENSE" }
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.9"
 authors = [{ name = "Arafat-debug765" }]
 keywords = ["security", "network", "anomaly-detection", "isolation-forest", "nids"]
@@ -16,7 +18,6 @@ classifiers = [
     "Environment :: Web Environment",
     "Framework :: Flask",
     "Intended Audience :: System Administrators",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -37,7 +38,9 @@ dependencies = [
 capture = ["scapy>=2.5"]
 # A real WSGI server, for `threat-detector serve --production`.
 server = ["gunicorn>=21.0"]
-dev = ["pytest>=8.0", "ruff>=0.6"]
+# `build` because CI builds the wheel, and a fresh dev environment should be
+# able to reproduce everything CI does.
+dev = ["pytest>=8.0", "ruff>=0.6", "build>=1.0"]
 all = ["ai-threat-detector[capture,server,dev]"]
 
 [project.scripts]
