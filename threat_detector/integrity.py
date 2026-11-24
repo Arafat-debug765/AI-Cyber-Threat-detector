@@ -36,10 +36,12 @@ _KEY_ENV = "MODEL_SIGNING_KEY"
 DIGEST_CHARS = 64  # hex-encoded SHA-256
 _HEADER_BYTES = DIGEST_CHARS + 1  # digest + newline
 
-# Where the key used to live. Keeping the model and the key that authenticates
-# it in the same directory meant anything able to write the model could usually
-# read the key too; the default moved out, and this is only read for migration.
+# Where the key used to live, newest first: `.secrets/` under the working
+# directory (1.0 pre-releases), and beside the model (0.2). Read only so that
+# upgrading does not silently invalidate models those versions signed; a new
+# key is never written to either place.
 LEGACY_KEY_FILE = "model_signing.key"
+LEGACY_SECRETS_DIR = ".secrets"
 
 
 class IntegrityError(RuntimeError):
@@ -60,15 +62,17 @@ def signing_key(key_file: Path, models_dir: Path | None = None) -> bytes:
     if key_file.exists():
         return key_file.read_bytes()
 
-    # Adopt a pre-existing key from the old location rather than silently
+    # Adopt a pre-existing key from an old location rather than silently
     # invalidating models an earlier version produced.
+    candidates = [Path.cwd() / LEGACY_SECRETS_DIR / LEGACY_KEY_FILE]
     if models_dir is not None:
-        legacy = Path(models_dir) / LEGACY_KEY_FILE
-        if legacy.exists():
-            logger.info("Adopting the signing key from its previous location %s", legacy)
+        candidates.append(Path(models_dir) / LEGACY_KEY_FILE)
+    for legacy in candidates:
+        if legacy.exists() and legacy.resolve() != key_file.resolve():
+            logger.info("Using the signing key from its previous location %s", legacy)
             return legacy.read_bytes()
 
-    key_file.parent.mkdir(parents=True, exist_ok=True)
+    key_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     key = secrets.token_bytes(32)
     # Create with owner-only permissions rather than writing then chmod-ing,
     # which would leave a window where the key is world-readable.

@@ -27,6 +27,37 @@ class BrowserLikeClient(FlaskClient):
         return super().open(*args, headers=headers, **kwargs)
 
 
+# Every setting Config reads from the environment. A developer's shell with
+# API_TOKEN or BASELINE_FILE exported must not change what the tests measure.
+_CONFIG_ENV = (
+    "DATA_FILE", "MODEL_FILE", "MODEL_KEY_FILE", "MODEL_SIGNING_KEY", "BASELINE_FILE",
+    "FEATURE_SET", "WINDOW_SECONDS", "MIN_SESSION_PACKETS", "MIN_WINDOW_COVERAGE",
+    "ALGORITHM", "N_ESTIMATORS",
+    "CONTAMINATION", "RANDOM_STATE", "CALIBRATION_QUANTILE", "SCORE_THRESHOLD",
+    "MAX_RESULTS", "FLASK_DEBUG", "API_TOKEN", "ALLOWED_HOSTS", "MAX_CONTENT_LENGTH",
+)
+
+
+@pytest.fixture(autouse=True)
+def hermetic_environment(tmp_path, monkeypatch):
+    """Give every test its own home, config directory and working directory.
+
+    Without this the suite was not hermetic: tests signed models with the
+    repository's real development key (found via the working directory), would
+    have written into the developer's actual ~/.config, and picked up whatever
+    configuration happened to be exported in the shell.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
+    for name in _CONFIG_ENV:
+        monkeypatch.delenv(name, raising=False)
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    monkeypatch.chdir(workdir)
+
+
 def train_and_wait(client, path: str = "/api/train", **kwargs) -> dict:
     """POST to the training endpoint and block until the job finishes.
 

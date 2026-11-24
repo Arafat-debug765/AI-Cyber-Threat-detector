@@ -1,4 +1,6 @@
 """Model files are unpickled, so they must be proven to be ours before loading."""
+from pathlib import Path
+
 import joblib
 import pytest
 
@@ -96,6 +98,41 @@ def test_key_lives_outside_the_model_directory(config, dataset):
     assert config.key_file.exists()
     assert config.key_file.parent != config.model_file.parent
     assert oct(config.key_file.stat().st_mode)[-3:] == "600"
+    assert oct(config.key_file.parent.stat().st_mode)[-3:] == "700"
+
+
+def test_default_key_is_in_the_user_config_dir(tmp_path):
+    """Not the working directory, and never the Python installation.
+
+    Paths used to resolve against the package's own location, so an installed
+    copy wrote its signing key into site-packages, shared by every user.
+    """
+    from threat_detector.config import Config
+
+    key = Config().key_file
+    assert key == tmp_path / "home" / ".config" / "threat-detector" / "model_signing.key"
+    import threat_detector
+
+    assert Path(threat_detector.__file__).parent.parent not in key.parents
+
+
+def test_relative_paths_mean_the_working_directory(tmp_path):
+    from threat_detector.config import Config
+
+    config = Config()
+    assert config.data_file == Path.cwd() / "data" / "packets.csv"
+    assert config.model_file == Path.cwd() / "models" / "model.pkl"
+
+
+def test_key_from_the_old_secrets_dir_is_adopted(tmp_path):
+    """1.0 pre-releases wrote the key to ./.secrets — keep those models valid."""
+    old = Path.cwd() / ".secrets" / "model_signing.key"
+    old.parent.mkdir()
+    old.write_bytes(b"b" * 32)
+
+    from threat_detector.config import Config
+
+    assert signing_key(Config().key_file) == b"b" * 32
 
 
 def test_legacy_key_is_adopted_not_discarded(tmp_path):
