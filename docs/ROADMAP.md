@@ -4,14 +4,16 @@ Ordered by what most changes whether the tool is useful, not by effort.
 
 ## Now — shipped in 1.0.0
 
-Installable, authenticated, reads real captures, detects all four reference
-attacks with no false positives, and proves it in CI.
+Installable, authenticated, reads real captures, and finds all four reference
+attacks in 300 of 300 independently recorded trials at a 1.3% false-alarm rate
+— verified in CI on every change, with the trials that once broke it pinned as
+regression tests.
 
 ## Next
 
 **A periodicity feature.** Beacon detection currently leans on
-`std_interarrival` within a single window, so a beacon whose period is close to
-`WINDOW_SECONDS` can be missed. Autocorrelation of inter-arrival times per
+`std_interarrival` within a single window, so a beacon whose period approaches
+`WINDOW_SECONDS` puts too few check-ins in each session to show its regularity. Autocorrelation of inter-arrival times per
 source over the whole capture would catch it regardless of alignment, and would
 also catch slow beacons that no window size currently sees.
 
@@ -50,6 +52,14 @@ should not.
 **Signatures or threat intelligence feeds.** Solved elsewhere, and better. The
 value here is catching the thing no signature exists for.
 
-**Replacing the model with a neural network.** The measured bottleneck was
-never model capacity — it was what the model was shown. Session features on an
-IsolationForest beat per-packet features on anything.
+**Replacing the model with a neural network.** The measured bottlenecks were
+never model capacity: they were what the model was shown (sessions, not
+packets), which question it was answering (novelty, not outlier detection), and
+how its threshold was measured (out-of-fold, not in-sample). Each of those
+mattered more than any model swap could.
+
+**Shrinking the false-alarm rate by tuning on the reference data.** It is
+synthetic. The 1.3% figure is a property of these generators; tuning it lower
+here would be fitting the test, not improving the tool. The honest lever is a
+longer baseline, which the measurements already show halves false alarms per
+doubling.

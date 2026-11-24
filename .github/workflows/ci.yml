@@ -11,8 +11,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 3.9 is the declared floor; 3.12 is what it should actually run on.
-        python-version: ["3.9", "3.12"]
+        # 3.9 is the declared floor; 3.13 is the newest supported.
+        python-version: ["3.9", "3.12", "3.13"]
 
     steps:
       - uses: actions/checkout@v4
@@ -54,11 +54,29 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Build and verify the wheel installs clean
+      - name: Build the wheel
         run: |
           pip install build
           python -m build --wheel
-          pip install dist/*.whl
-          threat-detector --version
+
+      - name: An installed copy works from any directory and writes nothing into itself
+        # Paths once resolved against the package's location, so an installed
+        # copy wrote the model and the signing key into site-packages. Editable
+        # installs hid it, because there the package location is the repo.
+        run: |
+          python -m venv /tmp/installed
+          /tmp/installed/bin/pip install dist/*.whl
+          mkdir /tmp/work && cd /tmp/work
+          export XDG_CONFIG_HOME=/tmp/work/config
+          /tmp/installed/bin/threat-detector --version
+          /tmp/installed/bin/threat-detector generate --output packets.csv
+          /tmp/installed/bin/threat-detector generate --output baseline.csv --no-attacks --seed 7
+          /tmp/installed/bin/threat-detector --data packets.csv --baseline baseline.csv selfcheck
+          SITE=$(/tmp/installed/bin/python -c "import threat_detector, pathlib; print(pathlib.Path(threat_detector.__file__).parent.parent)")
+          for leaked in models data .secrets; do
+            if [ -e "$SITE/$leaked" ]; then echo "::error::wrote $leaked into site-packages"; exit 1; fi
+          done
+          test -f models/model.pkl
+          test -f config/threat-detector/model_signing.key
       - name: Build the container image
         run: docker build -t ai-threat-detector:ci .

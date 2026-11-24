@@ -80,9 +80,9 @@ packet is unusual:
 
 | | per-packet | per-session |
 |---|---|---|
-| Attacks found | 2 of 4, never the port scan | **4 of 4, in 12 of 12 runs** |
-| Alerts to review | 346 | **7** |
-| Alerts on clean traffic | 4, all false | **2 — the calibrated budget** |
+| Attacks found | 2 of 4, never the port scan | **4 of 4, in 300 of 300 trials** |
+| Alerts to review | 346 | **~5** |
+| False alarms on separate clean traffic | — | **1.3%** |
 
 ## Why it fits on a baseline
 
@@ -100,46 +100,104 @@ sequenceDiagram
     participant T as train
     participant D as detect
     O->>T: baseline.csv (asserted clean)
-    T->>T: fit; score the baseline
-    T->>T: threshold = quantile(baseline scores, q)
+    T->>T: split into 5 folds; score each fold<br/>with a model fitted on the other four
+    T->>T: threshold = quantile(out-of-fold scores, q)
+    T->>T: fit the final model on all of it
     T-->>O: signed bundle with its threshold
     O->>D: packets.csv (under suspicion)
-    D->>D: score with the same model
+    D->>D: score with the final model
     D-->>O: sessions below the threshold, worst first
 ```
 
-`q` is a **target false-positive rate**: the threshold sits at that quantile of
-the baseline's own scores, so `q = 0.02` means "accept about 2% of known-good
-sessions alarming". That is an operating point on the ROC curve, and it was
-chosen by measurement rather than taste — across eight independent baselines,
-`0.02` caught all four reference attacks every time, while `0.0` managed it in
-six of eight.
-
 Without a baseline there is nothing to calibrate against, so the app falls back
-to a quota over the inspected traffic and logs a warning. A quota is not
-detection — it is a fixed alert budget — and it exists only so a first run does
-something.
+to flagging a fixed 2% of the inspected traffic and logs a warning. A quota is
+not detection — it is an alert budget — and on the reference data it found
+about half the attacks. It exists only so a first run does something.
 
-### The calibration trap
+## Choosing the detector: novelty, not outlier, detection
 
-Calibrating at the exact minimum makes the threshold hostage to the single
-weirdest session in the baseline. In practice that was a **one-packet window**
-at the edge of the capture — an artifact of where recording started, not
-behaviour — which scored so low that a 200-host sweep slipped under it.
-`MIN_SESSION_PACKETS` (default 3) drops windows too small to describe
-behaviour before fitting. That one change moved detection from 2 of 4 attacks
-to 4 of 4.
+These are different problems, and the project spent two releases solving the
+wrong one.
 
-`MIN_SESSION_PACKETS` removes the most common artifact, but not the general
-problem: at `q = 0.0` the threshold is *always* the single lowest baseline
-score, whatever that happens to be. A 4-packet session scoring 0.147 below
-everything else was still enough to hide three of four attacks. That is why the
-default rate is not zero, and why training warns when one session is visibly
-deciding the bar.
+- **Outlier detection** fits on data that contains the anomalies and asks which
+  points are odd. IsolationForest is good at it. LOF is weak at it in one
+  specific way: a tight cluster of anomalies looks locally *dense*, and density
+  is what LOF measures.
+- **Novelty detection** fits on data asserted to be clean and asks how far new
+  points are from it. That is what this application does as soon as a baseline
+  is supplied.
 
-The general lesson is in the code as a comment, because it will recur: **any
-statistic taken at the extreme of a small sample is set by its worst
-artifact.**
+The first benchmark (`scripts/benchmark_models.py`) fitted on contaminated
+data, so it answered the outlier question, and IsolationForest won. Under the
+novelty question the result reverses, for a reason that is easy to miss:
+**IsolationForest scores do not extrapolate.** A point beyond the training
+range is isolated by the first split on that feature, exactly like a point *at*
+the edge of the range. So a session moving 560 KB, against a baseline topping
+out near 70 KB, scored like the baseline's largest ordinary host. LOF's score is
+a ratio of distances, and keeps growing as a session moves away.
+
+Measured on identical trials — capture and baseline recorded independently,
+both detectors with the coverage filter described below:
+
+| detector | all four attacks found | worst trial |
+|---|---|---|
+| IsolationForest | 695/700 | 2 of 4 |
+| **LOF** | **700/700** | 4 of 4 |
+
+Without the coverage filter, IsolationForest once missed all four.
+
+Packet mode keeps IsolationForest, because packet mode exists to reproduce the
+original design and its documented figures.
+
+## Calibration: four traps, all found the same way
+
+Each of these passed every unit test. Each was found by generating hundreds of
+captures with independent recording times and looking at the ones that failed.
+
+**1. The threshold was set by an artifact.** Calibrating at the minimum
+baseline score makes the bar hostage to the weirdest session there. That was a
+one-packet window at a capture boundary. `MIN_SESSION_PACKETS` (default 3)
+drops windows too small to describe behaviour.
+
+**2. Windows followed the wall clock.** Sessions were cut at clock boundaries
+(:00, :05, …), so a capture starting at 03:54:58 got a two-second first window
+whose sliver sessions set the threshold — and the same traffic recorded a
+minute later analysed correctly. **Results depended on the time of day.**
+Windows are now anchored at each capture's first packet.
+
+**3. The last window could still be a sliver.** Anchoring fixes the start, not
+the end. Three packets in one final second — zero inter-arrival gaps, almost no
+volume — looked like the most anomalous thing in the baseline and hid all four
+attacks. `MIN_WINDOW_COVERAGE` (default 0.5) drops sessions from a window the
+capture spans for under half its length.
+
+**4. The threshold was measured in-sample.** Scoring a novelty model against
+its own training data is biased toward "normal": every training point is its
+own nearest neighbour. A threshold set on those flattering scores was too
+tight, and on separate clean captures ordinary hosts crossed it — 17 false
+alarms out of 50 sessions in the worst case. The threshold is now set on
+**out-of-fold** scores, which cut the false-alarm rate from 1.9% to 1.5% and the
+worst case from 17 to 9.
+
+That last one also invalidated a claim this document used to make. Earlier
+versions reported false alarms by scoring the model against the baseline it
+was trained on, and so understated them. Every false-alarm figure here is now
+measured on a separate clean capture.
+
+### The operating point
+
+`q` is where the threshold sits among out-of-fold baseline scores. With LOF
+and out-of-fold calibration, `q = 0.0` is the best measured setting: all four
+attacks in 200 of 200 trials, a 1.5% false-alarm rate. Under IsolationForest the
+trade-off had run the other way — its saturated scores put attacks barely past
+the baseline's edge, so the strictest threshold cost recall. That no longer
+holds.
+
+### The lesson that keeps recurring
+
+**Any statistic taken at the extreme of a small sample is set by its worst
+artifact** — and an extreme measured on the data that produced it is
+optimistic. Traps 1, 3 and 4 are all instances. Expect a fifth.
 
 ## Module map
 
@@ -211,8 +269,12 @@ Honest limits, since they decide whether this fits a given job:
 
 - The capture is loaded into memory as a DataFrame. Roughly 1 GB of RAM per
   ~10 million packet rows; beyond that, split the capture by time.
-- Session aggregation is `O(packets)`, scoring is `O(sessions × trees)`. On the
-  6,900-packet demo the whole pipeline runs in well under a second.
+- Session aggregation is `O(packets)` and fully vectorised. Measured: 100k
+  packets aggregate in ~0.5s; end to end, 1M packets train in ~6s and 2M
+  (60,000 sessions) in ~12s. LOF costs within ~15% of IsolationForest — CSV
+  parsing dominates, not the model.
+- Calibration fits five extra models (one per fold), which is cheap next to
+  parsing at every size measured.
 - Scoring is memoised on `(model, capture)` file fingerprints, so the dashboard's
   two endpoints share one pass instead of scoring the capture twice per click.
 - Training runs on a worker thread with state on disk, so it survives an HTTP

@@ -3,13 +3,14 @@
 Finds hosts behaving unlike the rest of your network, from a packet capture.
 
 It groups packets into per-source time windows, learns what normal looks like
-from a capture you know is clean, and reports the sessions that do not match —
-ranked, and **silent when nothing is wrong**.
+from a capture you know is clean, and reports the sessions that do not match,
+ranked so the ones furthest from normal come first.
 
-On the bundled reference capture it finds a port scan, a host sweep, a C2
-beacon and a data exfil — **4 of 4 across 12 independent runs**, at about **2
-false alerts per 75 sessions** — where scoring the same traffic packet-by-packet
-finds 2 and needs 346 alerts to do it.
+On the bundled reference attacks — a port scan, a host sweep, a C2 beacon and a
+data exfil — it found **all four in 300 of 300 trials** with independently
+recorded captures, at a **1.3% false-alarm rate** on separate clean traffic
+(no false alarms at all on 62% of clean captures). Scoring the same traffic
+packet-by-packet finds 2 of 4 and needs 346 alerts to do it.
 
 ---
 
@@ -38,23 +39,26 @@ threat-detector --data packets.csv detect
 ```
 
 ```
-7 of 79 sessions flagged
+6 of 55 sessions flagged
 
 src_ip        window_start              packets  bytes_total  distinct_dst_ips  distinct_dst_ports  std_interarrival  anomaly_score
-192.168.0.66  2026-09-20T04:30:00.000Z  300      13200        1                 300                 0.2183            -0.2377
-192.168.0.69  2026-09-20T04:35:00.000Z  400      559659       1                 1                   0.1402            -0.2288
-192.168.0.67  2026-09-20T04:35:00.000Z  200      12000        200               1                   0.2719            -0.2168
-192.168.0.68  2026-09-20T04:30:00.000Z  10       1280         1                 1                   0.0000            -0.2008
+192.168.0.66  2026-11-24T04:32:44.000Z  300      13200        1                 300                 0.2183            -110.7284
+192.168.0.67  2026-11-24T04:37:44.000Z  200      12000        200               1                   0.2719            -73.2035
+192.168.0.68  2026-11-24T04:32:44.000Z  10       1280         1                 1                   0.0000            -40.4965
+192.168.0.68  2026-11-24T04:37:44.000Z  10       1280         1                 1                   0.0000            -40.4965
+192.168.0.69  2026-11-24T04:37:44.000Z  400      559659       1                 1                   0.1402            -37.1628
+192.168.0.34  2026-11-24T04:32:44.000Z  156      73744        3                 5                   1.9403            -0.5814
 ```
 
-Those are, in order: a port scan (300 ports, one host), an exfil (560 KB to one
-external address), a host sweep (200 hosts, one port), and a C2 beacon — whose
-tell is `std_interarrival` of exactly zero. Machines keep time; people do not.
+In order: a port scan (300 ports, one host), a host sweep (200 hosts, one
+port), a C2 beacon in two consecutive windows — its tell is `std_interarrival`
+of exactly zero, because machines keep time and people do not — and an exfil
+(560 KB to one external address).
 
-The remaining alerts are the calibrated false-positive budget, and that budget
-is the point: the alert threshold is set at a chosen quantile of the baseline's
-own scores, so `CALIBRATION_QUANTILE` **is** the false-positive rate you are
-accepting. It defaults to 2%, which was measured — see below.
+Read the last column. The attacks score between −37 and −111; the one ordinary
+host that crossed the line scores −0.58, barely past the threshold of −0.20.
+The ranking puts what matters at the top by a wide margin, which is what a
+queue to investigate needs.
 
 ## Use it on your own traffic
 
@@ -67,7 +71,27 @@ threat-detector --data packets.csv detect
 
 **The baseline is the most important input.** Fitting on the traffic you are
 inspecting teaches the model that whatever is in there is normal. Point
-`--baseline` at a capture from a period you believe was clean.
+`--baseline` at a capture from a period you believe was clean. Without one, the
+tool falls back to flagging a fixed 2% of the capture, and on the reference data
+that found about half the attacks.
+
+**A longer baseline means fewer false alarms**, and nothing else changes: every
+attack was found at every length measured.
+
+| baseline recorded | sessions | false alarms per clean capture | clean captures with none |
+|---|---|---|---|
+| 10 minutes | ~50 | 0.99 | 49% |
+| 20 minutes | ~100 | 0.44 | 73% |
+| 40 minutes | ~200 | **0.21** | **84%** |
+
+Training warns when a baseline is under 100 sessions.
+
+Captures from real networks are messy, and that is handled rather than fatal:
+IPv6 packets, blank or malformed fields, and padded CSV headers are dropped or
+tolerated, with the counts reported as `rows_dropped` in every result.
+Timestamps may be ISO-8601 or Unix epoch (seconds, ms, µs or ns). A capture
+that is damaged part-way through is salvaged up to the damage and reported as
+`[PARTIAL]`, and a failed ingest never overwrites an existing file.
 
 Capture live instead (needs root, and permission to monitor the network):
 
@@ -110,6 +134,7 @@ Put your `packets.csv` and `baseline.csv` in `./data`.
 ## Configuration
 
 Every setting is an environment variable; see [.env.example](.env.example).
+Relative paths mean the directory you run the command from.
 The ones that change results:
 
 | Variable | Default | Meaning |
@@ -117,47 +142,57 @@ The ones that change results:
 | `BASELINE_FILE` | unset | known-good capture to fit on — **set this** |
 | `DATA_FILE` | `data/packets.csv` | the capture under inspection |
 | `WINDOW_SECONDS` | `300` | session length. Must exceed the period of any beacon you hope to see |
-| `MIN_SESSION_PACKETS` | `3` | windows smaller than this are artifacts, not behaviour |
-| `CALIBRATION_QUANTILE` | `0.02` | target false-positive rate against the baseline |
+| `MIN_SESSION_PACKETS` | `3` | sessions smaller than this are artifacts, not behaviour |
+| `MIN_WINDOW_COVERAGE` | `0.5` | drop sessions from a window the capture barely spans |
+| `CALIBRATION_QUANTILE` | `0.0` | where the threshold sits among baseline scores (see below) |
 | `FEATURE_SET` | `flow` | `flow` (sessions) or `packet` (the original, kept for comparison) |
-| `ALGORITHM` | `iforest` | `iforest`, or `lof` for contextual anomalies |
+| `ALGORITHM` | `auto` | `auto` (LOF for sessions), `lof`, or `iforest` |
 | `API_TOKEN` | unset | required to serve off loopback |
 | `ALLOWED_HOSTS` | loopback names | `Host` allowlist; blocks DNS rebinding |
-| `MODEL_KEY_FILE` | `.secrets/…` | HMAC key protecting the model file |
+| `MODEL_KEY_FILE` | `~/.config/threat-detector/…` | HMAC key protecting the model file |
 
 `WINDOW_SECONDS` matters more than the choice of model. Measured on the
 reference capture: 60s finds 3 of 4 attacks, **300s finds 4 of 4**, 600s drops
 back to 3.
 
-`CALIBRATION_QUANTILE` is the operating point. Measured across eight
-independent baselines:
+`CALIBRATION_QUANTILE` is the operating point: the threshold sits at that
+quantile of the baseline's scores, each computed by a model that did not see
+the session it is scoring. Measured over 200 trials, with false alarms counted
+on a *separate* clean capture:
 
-| rate | attacks caught /4 | alerts on ~75 clean sessions |
+| rate | all four attacks found | false-alarm rate on separate clean traffic |
 |---|---|---|
-| `0.0` — nothing known-good may alarm | 4/4 in 6 of 8 runs | 0 |
-| `0.01` | 4/4 in 7 of 8 | 1 |
-| **`0.02` (default)** | **4/4 in 8 of 8** | 2 |
-| `0.05` | 4/4 in 8 of 8 | 4 |
+| **`0.0` (default)** | **200/200** | **1.5%** |
+| `0.01` | 200/200 | 1.8% |
+| `0.02` | 200/200 | 2.7% |
 
-`0.0` sounds strictest and is the weakest: with the threshold at the single
-lowest baseline score, whatever freak session the baseline happens to contain
-sets the bar, and real attacks score above it. The app warns when it detects
-that happening. Set `0.0` when a missed detection costs less than a false one.
+With the default detector, the strictest setting costs nothing in recall: attack
+sessions score dozens of times further from normal than the threshold, so
+there is no recall to trade. Training warns if a single freak baseline session
+is setting the bar.
 
 ## How it decides
 
 Eleven behavioural features per session — packet and byte counts, payload size
 spread, distinct destination hosts, ports and protocols, inter-arrival mean and
-deviation, small-packet and external-destination ratios. An IsolationForest is
-fitted on the baseline, and the alert threshold is calibrated as a quantile of
-the baseline's own scores, so "unusual" means unusual *for your network*.
+deviation, small-packet and external-destination ratios. A Local Outlier Factor
+model is fitted on the baseline, and the alert threshold is calibrated on
+out-of-fold scores, so "unusual" means unusual *for your network*.
 
-Model choice was measured, not assumed
-([`scripts/benchmark_models.py`](scripts/benchmark_models.py)): IsolationForest
-wins on globally extreme anomalies, LOF by 4× on contextual ones, and an
-IF+LOF ensemble was tried and rejected as worse than either alone. The far
-bigger win came from changing *what the model looks at* rather than which model
-looks at it — see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+**Why LOF.** Fitting on known-clean traffic is *novelty* detection, and LOF's
+distance-based score keeps growing the further a session moves from anything
+normal. IsolationForest's does not: a session at ten times the baseline maximum
+isolates like one *at* the maximum. So an exfil moving 560 KB against a ~45 KB
+baseline scored as less anomalous than an ordinary host. On identical trials
+LOF found all four attacks 700 times out of 700; IsolationForest 695, missing
+up to two attacks in a run. IsolationForest is still the
+default for packet mode, and available via `ALGORITHM=iforest`.
+
+An earlier version of this project chose IsolationForest — from a benchmark run
+on contaminated data, where LOF's real weakness (a tight cluster of anomalies
+looks locally dense) applies. A clean baseline removes that weakness. The
+benchmark answered a question the application no longer asks. See
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## What this is not
 
@@ -174,7 +209,7 @@ so signing makes them safe to reload, never safe to accept from someone else.
 
 ```bash
 pip install -e '.[all]'
-pytest                # 118 tests
+pytest                # 188 tests, ~20s
 ruff check .
 threat-detector --baseline data/baseline.csv selfcheck
 ```

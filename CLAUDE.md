@@ -18,6 +18,7 @@ threat-detector serve                                               # 127.0.0.1:
 pytest                                   # whole suite
 ruff check .                             # lint (ruff.toml, target py39)
 pytest tests/test_sessions.py::test_flow_mode_flags_the_scanner     # one test
+timeout 300 pytest                       # the suite runs in ~10s; a hang is a bug
 pytest -k calibration                    # by keyword
 ```
 
@@ -34,8 +35,13 @@ HTTP layer holds no logic:
 - `threat_detector/config.py` — frozen `Config` dataclass, every field from an env var.
   Paths resolve against `BASE_DIR`. **Config is passed in, never read from
   globals** — that is what lets tests point the app at a `tmp_path` dataset.
-- `threat_detector/features.py` — CSV load, validation, feature engineering. Raises
-  `DataError` for anything wrong with the data.
+- `threat_detector/features.py` — CSV load, cleaning, per-packet features, and
+  the one CSV schema (`CSV_FIELDS`) every producer writes. `clean_packets`
+  **drops rows that cannot be analysed and records why** in
+  `.attrs["rows_dropped"]`, surfaced in every train/detect result; it raises
+  `DataError` only when nothing usable is left. Rejecting a whole capture over
+  one IPv6 row made the tool unusable on dual-stack networks; dropping silently
+  would make it untrustworthy. Keep both halves of that.
 - `threat_detector/model.py` — `train`, `detect`, `summarize`, `status`. Raises
   `ModelNotTrained` when no `model.pkl` exists.
 - `threat_detector/routes.py` — thin handlers that call the service layer and map domain
@@ -64,45 +70,89 @@ Anything building a row for the model must use a **named DataFrame** so sklearn
 matches columns by name, not position.
 
 **`BASELINE_FILE` is the setting that matters most.** Fitting on the traffic
-under inspection teaches the model the attack is normal. With a baseline the
-threshold is calibrated at quantile 0.0 of the baseline scores (nothing
-known-good may alarm); without one it silently degrades to a 2% quota and logs a
-warning. Do not "fix" a quiet detector by removing the baseline.
+under inspection teaches the model the attack is normal; without a baseline the
+app flags a fixed 2% quota and logs a warning, which found ~half the reference
+attacks. Do not "fix" a quiet detector by removing the baseline.
 
 The saved artifact is a **bundle** (`BUNDLE_VERSION`), not a bare estimator: it
-carries the threshold, feature set, window and columns, and `load_model` refuses
-a bundle whose feature set disagrees with the current config.
+carries the threshold, feature set, algorithm, window and columns, and
+`load_model` refuses a bundle whose feature set, algorithm or window disagrees
+with the current config.
+
+**Timestamps go through `features.parse_timestamps`, never bare
+`pd.to_datetime`.** pandas reads an integer as nanoseconds, so epoch seconds —
+what tcpdump, tshark and scapy export — became 1970, every packet fell in one
+window, and detection silently produced garbage. The helper infers the unit
+from magnitude.
+
+**Relative paths mean the working directory; the key lives in
+`~/.config/threat-detector/`.** Paths once resolved against the package
+location, so an installed copy wrote its model and signing key into
+site-packages. Editable installs hid this because there the package *is* the
+repo. CI installs the wheel into a fresh venv and fails if anything lands
+inside it.
 
 `contamination` is a budget, not a discovery: the model flags that fraction of
 the dataset whether or not that many packets are genuinely abnormal.
 
-**`CALIBRATION_QUANTILE` is a target false-positive rate, not a safety margin.**
-The threshold sits at that quantile of the *baseline's* scores, so 0.02 means
-"accept ~2% of known-good sessions alarming". Setting it to 0.0 sounds stricter
-and detects worse: the bar becomes the single lowest baseline score, so one
-freak session decides it. Measured across eight baselines — 0.02 caught 4/4
-reference attacks every run, 0.0 managed 6 runs out of 8. Do not "tighten" this
-to 0.0 without re-running `selfcheck` across several seeds.
+**Detector: `ALGORITHM=auto` → LOF in flow mode, IsolationForest in packet
+mode.** With a baseline this is *novelty* detection, and IsolationForest scores
+do not extrapolate — a session at 10× the baseline maximum isolates like one at
+the maximum, so a 560 KB exfil scored as less anomalous than an ordinary host.
+LOF: 700/700 trials found all four attacks; IsolationForest: 695/700. The old
+`scripts/benchmark_models.py` result (IsolationForest wins) fitted on
+contaminated data — the outlier-detection question, not the one the app asks.
 
-`MIN_SESSION_PACKETS` removes the commonest such artifact (a one-packet window
-at a capture boundary). Any statistic taken at the extreme of a small sample is
-set by its worst artifact — expect this class of bug to recur.
+**Calibration is out-of-fold** (`model._out_of_fold_scores`, 5 folds, seeded):
+each baseline session is scored by a model that never saw it. A novelty model
+scoring its own training data is biased toward "normal", so in-sample
+thresholds were too tight. `CALIBRATION_QUANTILE` defaults to **0.0** — measured
+best with LOF: 200/200 trials, 1.5% false alarms on *separate* clean traffic.
+
+**Measure false alarms on separate clean traffic, never on the baseline.**
+In-sample figures are optimistic by construction; this project published
+in-sample numbers for two releases before catching it. `selfcheck`'s
+clean-baseline check is a 5% regression tripwire, not an FP estimate.
+
+**Windows are anchored at each capture's first packet**, never the wall clock:
+clock-aligned windows made results depend on the time of day a capture started
+(a 2-second first window's sliver sessions hid 3 of 4 attacks).
+`MIN_WINDOW_COVERAGE` (0.5) drops sessions from a final window the capture
+barely spans; `MIN_SESSION_PACKETS` (3) drops tiny sessions. Any statistic taken
+at the extreme of a small sample is set by its worst artifact — expect this
+class of bug to recur.
+
+**Verify detection changes with randomised trials, not single runs**: generate
+hundreds of capture/baseline pairs with independent seeds *and independent
+start times with sub-second jitter*. Every calibration bug above passed the
+unit tests and a fixed-seed selfcheck; each was found this way.
+`tests/test_detection_quality.py` pins the specific trials that once failed —
+each verified to fail on the old defaults. A regression case that passes on
+the old behaviour guards nothing.
+
+`synth.generate` is reproducible only because `start` is floored to the second;
+an unfloored clock made the same seed yield different traffic.
 
 `model.scored()` memoises one scoring pass per (model, capture) fingerprint;
 `/api/anomalies` and `/api/summary` share it. Call `clear_cache()` after
 anything that changes the model.
 
-`ALGORITHM` picks the detector (`iforest` default, `lof` alternative) via
-`model.build_estimator`. The choice is benchmarked, not assumed — run
-`scripts/benchmark_models.py` before changing the default; its `overlapping`
-regime is the one that actually separates the candidates. An IF+LOF rank
-ensemble was measured and rejected as worse than either alone.
-
 ## Constraints worth keeping
 
-- **The API is unauthenticated.** Error strings and JSON responses must never
-  contain absolute paths — `features.py` names files, `model.py:_public_path`
-  relativises them. There are tests asserting this.
+- **Responses never contain absolute paths.** Even with `API_TOKEN` set, a path
+  discloses the host account name and layout — `features.py` names files,
+  `model.py:_public_path` relativises them. There are tests asserting this.
+- **Tests are hermetic** (`conftest.py:hermetic_environment`): each gets its own
+  HOME, XDG_CONFIG_HOME and working directory, and every config env var is
+  cleared. Before this the suite signed models with the repo's real dev key and
+  picked up whatever was exported in the shell. A new setting means adding its
+  env var to `_CONFIG_ENV`.
+- **No test may start a real server** — `test_cli.py` patches `Flask.run`. One
+  that did hung the suite indefinitely.
+- **Ingest writes atomically and detects truncation from the container
+  structure**, not from scapy's file position: scapy treats a cut-off final
+  record as EOF, so a damaged capture used to report success and overwrite good
+  data with a fragment.
 - **Packet data is attacker-influenced.** The front end renders values with
   `textContent` and builds SVG with `createElementNS`. Never introduce
   `innerHTML` with data-derived strings.

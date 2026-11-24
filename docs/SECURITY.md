@@ -50,6 +50,15 @@ operator running this as intended.
 | 14 | Low | `scripts/inspect_model.py` crashed against the current model format and loaded it without verifying the signature. | Replaced by `threat-detector inspect`, which goes through the verified loader. |
 | 15 | Low | A catch-all handler turned ordinary 404s and 405s into 500s. | `HTTPException` handled above the catch-all. |
 | 16 | Low | No `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, or CSP. | Set on every response. |
+| 17 | **High** | An installed copy (`pip install`, not a source checkout) wrote its model **and signing key into site-packages**: shared by every user of that Python, a `PermissionError` on a system install, orphaned by uninstall. Editable installs hid it. | Relative paths resolve against the working directory; the key defaults to `~/.config/threat-detector/` (dir `0700`, file `0600`). CI installs the wheel into a fresh venv and fails if anything is written inside it. |
+| 18 | **High** | Epoch-second timestamps were parsed as nanoseconds, so a 2026 capture landed in 1970, every packet fell into one session, and detection silently produced garbage. | Numeric timestamps have their unit inferred from magnitude (s/ms/µs/ns). |
+| 19 | **High** | Ingesting a capture that was damaged mid-file reported success and **overwrote existing data** with the fragment read before the damage. | Atomic write; truncation detected by walking pcap record headers / pcapng block lengths, reported as `[PARTIAL]` with a byte count. |
+| 20 | Medium | One IPv6, blank or malformed row rejected the entire capture. | Unanalysable rows are dropped, counted by reason, and reported in every result. |
+| 21 | Medium | Host-checking `/health` made a container whose `ALLOWED_HOSTS` named its real domain fail its own healthcheck — and get restart-looped. | `/health` (which returns nothing) is exempt from the Host check; data endpoints are not. |
+| 22 | Low | The test suite was not hermetic: it signed models with the repository's real development key and picked up the developer's exported configuration. | Per-test HOME, config dir and working directory; all config env vars cleared. |
+| 23 | **High** | Detection depended on the time of day a capture started: windows were cut at wall-clock boundaries, and a capture beginning seconds before one produced sliver sessions that set the threshold and hid three of four attacks. | Windows anchored at each capture's first packet; sessions from a barely-spanned final window dropped. |
+| 24 | **High** | IsolationForest scores saturate at the edge of the baseline, so traffic far outside it (a 560 KB exfil against ~45 KB normal) scored no worse than the baseline's own extremes and could be missed. | LOF is the default detector for sessions: 700/700 trials found all four attacks, against 695/700. |
+| 25 | Medium | The alert threshold was calibrated on in-sample scores, which a novelty model biases toward "normal"; ordinary new traffic crossed it (worst case 17 false alarms in 50 sessions), and published false-alarm figures were understated. | Out-of-fold calibration; every false-alarm figure re-measured on separate clean traffic. |
 
 ### Accepted, with reasons
 
@@ -66,6 +75,7 @@ operator running this as intended.
 | Gap | Impact |
 |---|---|
 | No audit log of who queried what | On a multi-operator install you cannot reconstruct who pulled the analysis. |
-| Beacon detection depends on window alignment | A beacon whose period is close to `WINDOW_SECONDS` may be missed. A periodicity feature over a longer horizon would fix it properly. |
-| No IPv6 | IPv4-only, and IPv6 packets are silently skipped at ingest. On a dual-stack network that is a blind spot. |
+| Beacon detection depends on the window length | A beacon whose period approaches `WINDOW_SECONDS` puts too few check-ins in each session to show its regularity. A periodicity feature over a longer horizon would fix it properly. |
+| Short baselines raise false alarms | ~50 baseline sessions: about one false alarm per clean capture; ~200: one in five. Training warns below 100. |
+| No IPv6 | IPv4-only. IPv6 packets are skipped at ingest and IPv6 rows dropped at analysis — counted and reported, not silent, but still a blind spot on a dual-stack network. |
 | Model files are still pickles | Signing makes them safe to *reload*, not safe to *share*. Never load a model someone sent you. |

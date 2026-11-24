@@ -3,7 +3,7 @@
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this project uses [semantic versioning](https://semver.org/).
 
-## [1.0.0] — 2026-09-20
+## [1.0.0] — 2026-11-24
 
 First release intended to be installed and used by someone other than its
 author.
@@ -19,8 +19,29 @@ author.
 - Docker image and compose file, running as a non-root user with a read-only
   root filesystem.
 - `docs/ARCHITECTURE.md` and `docs/SECURITY.md`.
+- Tests for the CLI and for capture ingestion, which had none; detection-quality
+  regression tests pinned to the specific trials that once failed; Dependabot;
+  CI on Python 3.13 and a check that an installed wheel works from any
+  directory.
 
 ### Changed
+- **The default detector for sessions is LOF**, and the threshold is calibrated
+  on out-of-fold scores at quantile 0.0. Measured with independently recorded
+  captures: all four reference attacks in 300/300 trials, a 1.3% false-alarm
+  rate on separate clean traffic. IsolationForest remains available and is
+  still the default for packet mode.
+- Session windows are anchored at each capture's first packet instead of the
+  wall clock, and sessions from a barely-spanned final window are dropped
+  (`MIN_WINDOW_COVERAGE`).
+- Training warns when the baseline has under 100 sessions.
+- Relative paths resolve against the working directory, and the signing key
+  defaults to `~/.config/threat-detector/`. **An installed copy previously wrote
+  both into site-packages.** Keys from earlier locations are still read, so
+  existing models keep verifying.
+- Unanalysable rows (IPv6, blank or malformed fields, non-positive lengths) are
+  dropped and counted in `rows_dropped` rather than rejecting the whole capture.
+- Session aggregation is vectorised: 8× faster on captures with many short
+  sessions (100k packets: 3.8s → 0.5s), with identical results.
 - Package renamed `app` → `threat_detector`; an installed distribution should
   not occupy a name that generic.
 - Model files are a single signed artifact; the separate `.sig` file is gone.
@@ -31,12 +52,21 @@ author.
   re-scoring the capture.
 
 ### Fixed
-- The alert threshold is a measured false-positive rate (default 2%) rather
-  than the lowest baseline score, which made recall hostage to whatever freak
-  session the baseline happened to contain. Sessions too small to describe
-  behaviour are dropped before fitting, and training warns when one session is
-  visibly deciding the threshold. Together: 4 of 4 reference attacks in 12 of
-  12 runs, up from 2 of 4.
+- Detection depended on the time of day a capture started; on unlucky timing,
+  three of four attacks went unreported.
+- False-alarm figures in earlier documentation were measured on the baseline
+  itself and so understated; all are now measured on separate clean traffic.
+- `synth.generate` was not reproducible: the same seed produced different
+  traffic depending on the sub-second part of the clock.
+- Epoch timestamps — the format tcpdump, tshark and scapy export — were read as
+  nanoseconds and landed in 1970, silently collapsing every packet into one
+  session.
+- A capture damaged mid-file reported success and overwrote existing data.
+  Ingest now writes atomically and flags truncated captures as `[PARTIAL]`.
+- The container healthcheck failed once `ALLOWED_HOSTS` named a real domain.
+- CSV headers padded with spaces are accepted.
+- Sessions too small to describe behaviour no longer set the alert threshold,
+  and training warns when one session is visibly deciding it.
 - Models are refused when the configuration they were fitted under no longer
   matches — previously a window-size change produced confident nonsense.
 - An interrupted training run no longer bricks the instance.
